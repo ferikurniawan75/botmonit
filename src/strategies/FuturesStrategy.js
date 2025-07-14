@@ -1,153 +1,351 @@
-const EventEmitter = require('events');
+// ===================================================================
+// FUTURES STRATEGY - IMPROVED VERSION WITH SAFETY VALIDATIONS
+// ===================================================================
+
+const { EventEmitter } = require('events');
+const cron = require('cron');
 const logger = require('../utils/logger');
 const config = require('../config/config');
 
 class FuturesStrategy extends EventEmitter {
-    constructor(binanceAPI, marketAnalyzer) {
+    constructor({ binanceFuturesAPI, marketAnalyzer, aiAnalyzer, riskManager }) {
         super();
-        this.binanceAPI = binanceAPI;
+        
+        this.binanceFuturesAPI = binanceFuturesAPI;
         this.marketAnalyzer = marketAnalyzer;
+        this.aiAnalyzer = aiAnalyzer;
+        this.riskManager = riskManager;
+        
+        // Strategy settings with validation
+        this.settings = this.validateAndSetSettings();
+        
+        // State management
+        this.isRunning = false;
         this.activePositions = new Map();
-        this.dailyStats = {
+        this.dailyStats = this.initializeDailyStats();
+        this.lastSignalCheck = 0;
+        this.consecutiveLosses = 0;
+        this.emergencyStop = false;
+        
+        // Monitoring
+        this.signalCheckJob = null;
+        this.performanceJob = null;
+        this.riskCheckJob = null;
+        
+        this.setupEventListeners();
+    }
+
+    validateAndSetSettings() {
+        const settings = {
+            symbol: config.DEFAULT_FUTURES_SYMBOL || 'BTCUSDT',
+            leverage: Math.min(Math.max(config.FUTURES_LEVERAGE || 10, 1), 50), // Limit leverage
+            qtyUsdt: Math.min(Math.max(config.FUTURES_QTY_USDT || 20, 1), 1000), // Limit position size
+            tpPercent: Math.min(Math.max(config.FUTURES_TP_PERCENT || 0.6, 0.1), 5), // Limit TP
+            slPercent: Math.min(Math.max(config.FUTURES_SL_PERCENT || 0.3, 0.1), 3), // Limit SL
+            rsiLongThreshold: Math.min(Math.max(config.RSI_LONG_THRESHOLD || 30, 15), 40),
+            rsiShortThreshold: Math.min(Math.max(config.RSI_SHORT_THRESHOLD || 70, 60), 85),
+            signalCheckInterval: Math.max(config.SIGNAL_CHECK_INTERVAL || 30, 10), // Min 10 seconds
+            dailyTargetPercent: Math.min(config.DAILY_TARGET_PERCENT || 5, 20), // Max 20%
+            dailyMaxLossPercent: Math.min(config.DAILY_MAX_LOSS_PERCENT || 3, 10), // Max 10%
+            minBalance: Math.max(config.MIN_ACCOUNT_BALANCE || 50, 10), // Min $10
+            maxConsecutiveLosses: Math.min(config.MAX_CONSECUTIVE_LOSSES || 5, 10)
+        };
+
+        // Log validated settings
+        logger.trade('Strategy settings validated', settings);
+        return settings;
+    }
+
+    initializeDailyStats() {
+        return {
+            date: new Date().toDateString(),
+            startBalance: 0,
+            currentBalance: 0,
             pnl: 0,
             trades: 0,
-            startBalance: 0,
-            targetProfit: 0,
+            wins: 0,
+            losses: 0,
+            maxProfit: 0,
             maxLoss: 0,
-            lastResetDate: new Date().toDateString()
+            lastReset: Date.now()
         };
-        this.isRunning = false;
-        this.checkInterval = null;
-        this.newsHours = [12, 14, 16, 20]; // UTC hours to avoid trading
-        
-        this.settings = {
-            symbol: config.DEFAULT_FUTURES_SYMBOL || 'BTCUSDT',
-            leverage: config.FUTURES_LEVERAGE || 10,
-            qtyUSDT: config.FUTURES_QTY_USDT || 20,
-            takeProfitPercent: config.FUTURES_TP_PERCENT || 0.6,
-            stopLossPercent: config.FUTURES_SL_PERCENT || 0.3,
-            rsiLongThreshold: config.RSI_LONG_THRESHOLD || 30,
-            rsiShortThreshold: config.RSI_SHORT_THRESHOLD || 70,
-            dailyTargetPercent: config.DAILY_TARGET_PERCENT || 5,
-            dailyMaxLossPercent: config.DAILY_MAX_LOSS_PERCENT || 3,
-            checkIntervalSeconds: config.SIGNAL_CHECK_INTERVAL || 30,
-            enableNewsFilter: config.ENABLE_NEWS_FILTER || true,
-            enableEMAFilter: config.ENABLE_EMA_FILTER || true,
-            enableBBFilter: config.ENABLE_BB_FILTER || true,
-            roiBasedTP: config.ROI_BASED_TP || false
-        };
+    }
+
+    setupEventListeners() {
+        // Listen for market analysis updates
+        if (this.marketAnalyzer) {
+            this.marketAnalyzer.on('technicalAnalysisUpdate', (data) => {
+                if (data.symbol === this.settings.symbol) {
+                    this.handleTechnicalUpdate(data);
+                }
+            });
+        }
+
+        // Listen for AI analysis updates
+        if (this.aiAnalyzer) {
+            this.aiAnalyzer.on('analysisComplete', (analysis) => {
+                if (analysis.symbol === this.settings.symbol) {
+                    this.handleAIAnalysis(analysis);
+                }
+            });
+        }
+
+        // Listen for risk events
+        if (this.riskManager) {
+            this.riskManager.on('emergencyStop', () => {
+                this.handleEmergencyStop();
+            });
+        }
     }
 
     async start() {
-        if (this.isRunning) {
-            logger.trade('Futures strategy already running');
-            return;
-        }
-
         try {
-            // Initialize futures trading
-            await this.initializeFutures();
-            
-            // Start signal checking
-            this.checkInterval = setInterval(() => {
-                this.checkSignals();
-            }, this.settings.checkIntervalSeconds * 1000);
+            if (this.isRunning) {
+                throw new Error('Strategy is already running');
+            }
+
+            logger.trade('Starting Futures Strategy...');
+
+            // Validate prerequisites
+            await this.validatePrerequisites();
+
+            // Initialize account settings
+            await this.initializeAccount();
+
+            // Reset daily stats if needed
+            this.checkAndResetDailyStats();
+
+            // Start monitoring jobs
+            this.startMonitoringJobs();
 
             this.isRunning = true;
-            logger.trade('Futures strategy started', this.settings);
-            
             this.emit('started');
-
-        } catch (error) {
-            logger.error('Failed to start futures strategy:', error);
-            throw error;
-        }
-    }
-
-    async stop() {
-        if (!this.isRunning) {
-            return;
-        }
-
-        try {
-            // Clear interval
-            if (this.checkInterval) {
-                clearInterval(this.checkInterval);
-                this.checkInterval = null;
-            }
-
-            // Close all positions
-            await this.closeAllPositions();
-
-            this.isRunning = false;
-            logger.trade('Futures strategy stopped');
             
-            this.emit('stopped');
-
-        } catch (error) {
-            logger.error('Error stopping futures strategy:', error);
-        }
-    }
-
-    async initializeFutures() {
-        try {
-            // Set leverage
-            await this.binanceAPI.setLeverage(this.settings.symbol, this.settings.leverage);
-            
-            // Set margin type to crossed
-            await this.binanceAPI.setMarginType(this.settings.symbol, 'CROSSED');
-            
-            // Get account info and set daily stats
-            const account = await this.binanceAPI.getFuturesAccount();
-            if (account) {
-                this.dailyStats.startBalance = parseFloat(account.totalWalletBalance);
-                this.dailyStats.targetProfit = this.dailyStats.startBalance * (this.settings.dailyTargetPercent / 100);
-                this.dailyStats.maxLoss = this.dailyStats.startBalance * (this.settings.dailyMaxLossPercent / 100);
-            }
-
-            // Get existing positions
-            await this.updatePositions();
-
-            logger.trade('Futures trading initialized', {
+            logger.trade('✅ Futures Strategy started successfully', {
                 symbol: this.settings.symbol,
                 leverage: this.settings.leverage,
-                balance: this.dailyStats.startBalance
+                positionSize: this.settings.qtyUsdt
             });
 
         } catch (error) {
-            logger.error('Failed to initialize futures trading:', error);
+            logger.error('❌ Failed to start Futures Strategy:', error);
             throw error;
+        }
+    }
+
+    async validatePrerequisites() {
+        // Check API connection
+        if (!this.binanceFuturesAPI) {
+            throw new Error('Binance Futures API not available');
+        }
+
+        // Test API connectivity
+        try {
+            await this.binanceFuturesAPI.testConnectivity();
+        } catch (error) {
+            throw new Error(`Binance API connectivity test failed: ${error.message}`);
+        }
+
+        // Check account permissions
+        try {
+            const accountInfo = await this.binanceFuturesAPI.getAccountInfo();
+            if (!accountInfo.canTrade) {
+                throw new Error('Futures trading not enabled on account');
+            }
+        } catch (error) {
+            throw new Error(`Failed to validate account: ${error.message}`);
+        }
+
+        // Validate balance
+        await this.validateAccountBalance();
+
+        // Check market data availability
+        if (this.marketAnalyzer) {
+            const marketData = this.marketAnalyzer.getMarketData(this.settings.symbol);
+            if (!marketData) {
+                logger.warn('Market data not available, requesting initial data...');
+                await this.marketAnalyzer.requestMarketData(this.settings.symbol);
+            }
+        }
+
+        logger.trade('✅ All prerequisites validated');
+    }
+
+    async validateAccountBalance() {
+        try {
+            const accountInfo = await this.binanceFuturesAPI.getAccountInfo();
+            const balance = parseFloat(accountInfo.totalWalletBalance);
+            
+            if (balance < this.settings.minBalance) {
+                throw new Error(`Insufficient balance: ${balance} USDT (minimum: ${this.settings.minBalance})`);
+            }
+
+            // Update daily stats
+            if (this.dailyStats.startBalance === 0) {
+                this.dailyStats.startBalance = balance;
+                this.dailyStats.currentBalance = balance;
+            }
+
+            logger.trade('✅ Balance validation passed', { balance, minimum: this.settings.minBalance });
+            return balance;
+
+        } catch (error) {
+            throw new Error(`Balance validation failed: ${error.message}`);
+        }
+    }
+
+    async initializeAccount() {
+        try {
+            logger.trade('Initializing account settings...');
+
+            // Set leverage
+            await this.binanceFuturesAPI.setLeverage(this.settings.symbol, this.settings.leverage);
+            
+            // Set margin type to ISOLATED for better risk management
+            try {
+                await this.binanceFuturesAPI.setMarginType(this.settings.symbol, 'ISOLATED');
+            } catch (error) {
+                // Margin type might already be set
+                if (error.response?.data?.code !== -4046) {
+                    logger.warn('Failed to set margin type:', error.message);
+                }
+            }
+
+            logger.trade('✅ Account settings initialized');
+
+        } catch (error) {
+            throw new Error(`Failed to initialize account: ${error.message}`);
+        }
+    }
+
+    startMonitoringJobs() {
+        // Signal checking job
+        this.signalCheckJob = new cron.CronJob(
+            `*/${this.settings.signalCheckInterval} * * * * *`,
+            () => this.checkSignals(),
+            null,
+            true,
+            'UTC'
+        );
+
+        // Performance monitoring job (every hour)
+        this.performanceJob = new cron.CronJob(
+            '0 0 * * * *',
+            () => this.updatePerformanceMetrics(),
+            null,
+            true,
+            'UTC'
+        );
+
+        // Risk monitoring job (every 5 minutes)
+        this.riskCheckJob = new cron.CronJob(
+            '0 */5 * * * *',
+            () => this.performRiskChecks(),
+            null,
+            true,
+            'UTC'
+        );
+
+        logger.trade('✅ Monitoring jobs started');
+    }
+
+    checkAndResetDailyStats() {
+        const today = new Date().toDateString();
+        if (this.dailyStats.date !== today) {
+            logger.trade('Resetting daily stats for new day');
+            this.dailyStats = this.initializeDailyStats();
+            this.consecutiveLosses = 0;
+            this.emergencyStop = false;
         }
     }
 
     async checkSignals() {
-        try {
-            // Check daily limits first
-            if (await this.checkDailyLimits()) {
-                return; // Stop trading if limits reached
-            }
+        if (!this.isRunning || this.emergencyStop) {
+            return;
+        }
 
-            // Check news hours filter
-            if (this.isNewsHour()) {
-                logger.trade('Skipping signals during news hours');
+        try {
+            // Rate limiting
+            const now = Date.now();
+            if (now - this.lastSignalCheck < 5000) { // Min 5 seconds between checks
                 return;
             }
+            this.lastSignalCheck = now;
 
-            // Update positions
-            await this.updatePositions();
+            // Check daily limits first
+            if (await this.checkDailyLimits()) {
+                return; // Stop if limits exceeded
+            }
 
-            // Check if we already have positions
-            const longPosition = this.activePositions.get('LONG');
-            const shortPosition = this.activePositions.get('SHORT');
+            // Check for existing positions
+            const positions = await this.getActivePositions();
+            const longPosition = positions.find(p => p.side === 'LONG');
+            const shortPosition = positions.find(p => p.side === 'SHORT');
 
+            // If we have positions, monitor them
             if (longPosition || shortPosition) {
-                logger.trade('Position already exists, skipping new signals', {
+                await this.monitorPositions(positions);
+                
+                // Update position tracking
+                this.updatePositionTracking(positions);
+                
+                this.emit('positionsUpdate', {
+                    timestamp: Date.now(),
+                    hasPositions: true,
                     long: !!longPosition,
-                    short: !!shortPosition
+                    short: !!shortPosition,
+                    positions: positions
                 });
                 return;
             }
 
+            // No positions, look for entry signals
+            await this.analyzeEntrySignals();
+
+        } catch (error) {
+            logger.error('Error checking signals:', error);
+            this.handleSignalError(error);
+        }
+    }
+
+    async checkDailyLimits() {
+        const dailyPnlPercent = (this.dailyStats.pnl / this.dailyStats.startBalance) * 100;
+
+        // Check profit target
+        if (dailyPnlPercent >= this.settings.dailyTargetPercent) {
+            logger.trade('✅ Daily profit target reached!', {
+                target: this.settings.dailyTargetPercent,
+                current: dailyPnlPercent.toFixed(2)
+            });
+            await this.stopTradingForDay('profit_target_reached');
+            return true;
+        }
+
+        // Check loss limit
+        if (Math.abs(dailyPnlPercent) >= this.settings.dailyMaxLossPercent) {
+            logger.trade('🚨 Daily loss limit exceeded!', {
+                limit: this.settings.dailyMaxLossPercent,
+                current: dailyPnlPercent.toFixed(2)
+            });
+            await this.stopTradingForDay('loss_limit_exceeded');
+            return true;
+        }
+
+        // Check consecutive losses
+        if (this.consecutiveLosses >= this.settings.maxConsecutiveLosses) {
+            logger.trade('🚨 Maximum consecutive losses reached!', {
+                losses: this.consecutiveLosses,
+                limit: this.settings.maxConsecutiveLosses
+            });
+            await this.stopTradingForDay('consecutive_losses');
+            return true;
+        }
+
+        return false;
+    }
+
+    async analyzeEntrySignals() {
+        try {
             // Get market data and indicators
             const marketData = this.marketAnalyzer.getMarketData(this.settings.symbol);
             const indicators = this.marketAnalyzer.getTechnicalIndicators(this.settings.symbol);
@@ -163,481 +361,811 @@ class FuturesStrategy extends EventEmitter {
             const isGreenCandle = latestCandle.close > latestCandle.open;
             const isRedCandle = latestCandle.close < latestCandle.open;
 
-            // Check RSI + Candlestick signals
-            const signal = this.analyzeEntrySignal(indicators, isGreenCandle, isRedCandle);
+            // Analyze signals
+            const signal = this.analyzeEntrySignal(indicators, isGreenCandle, isRedCandle, marketData);
 
             if (signal.action !== 'WAIT') {
+                logger.trade('Signal detected', signal);
+
                 // Apply additional filters
-                if (await this.applyFilters(signal, indicators, priceHistory)) {
-                    await this.executeEntry(signal, marketData.price);
+                const filteredSignal = await this.applySignalFilters(signal, indicators, priceHistory, marketData);
+                
+                if (filteredSignal.approved) {
+                    await this.executeEntry(filteredSignal, marketData.price);
+                } else {
+                    logger.trade('Signal filtered out', { 
+                        reason: filteredSignal.rejectionReason,
+                        originalSignal: signal.action
+                    });
                 }
             }
 
         } catch (error) {
-            logger.error('Error checking signals:', error);
+            logger.error('Error analyzing entry signals:', error);
         }
     }
 
-    analyzeEntrySignal(indicators, isGreenCandle, isRedCandle) {
+    analyzeEntrySignal(indicators, isGreenCandle, isRedCandle, marketData) {
         const signal = {
             action: 'WAIT',
             reason: '',
-            confidence: 0
+            confidence: 0,
+            entryPrice: marketData.price,
+            symbol: this.settings.symbol
         };
 
-        // RSI + Candlestick Logic
+        // RSI + Candlestick Logic with improved conditions
         if (indicators.RSI < this.settings.rsiLongThreshold && isGreenCandle) {
-            signal.action = 'LONG';
+            // Additional confirmation for long signals
+            const isEMASupport = indicators.EMA_12 && indicators.EMA_26 && 
+                                indicators.EMA_12 > indicators.EMA_26;
+            const isVolumeGood = marketData.volume && marketData.volume > marketData.avgVolume * 1.2;
+            
+            signal.action = 'BUY';
+            signal.side = 'LONG';
             signal.reason = `RSI oversold (${indicators.RSI.toFixed(2)}) + Green candle`;
-            signal.confidence = (this.settings.rsiLongThreshold - indicators.RSI) / this.settings.rsiLongThreshold;
+            signal.confidence = this.calculateConfidence(indicators, 'LONG', isEMASupport, isVolumeGood);
+            
         } else if (indicators.RSI > this.settings.rsiShortThreshold && isRedCandle) {
-            signal.action = 'SHORT';
+            // Additional confirmation for short signals
+            const isEMAResistance = indicators.EMA_12 && indicators.EMA_26 && 
+                                  indicators.EMA_12 < indicators.EMA_26;
+            const isVolumeGood = marketData.volume && marketData.volume > marketData.avgVolume * 1.2;
+            
+            signal.action = 'SELL';
+            signal.side = 'SHORT';
             signal.reason = `RSI overbought (${indicators.RSI.toFixed(2)}) + Red candle`;
-            signal.confidence = (indicators.RSI - this.settings.rsiShortThreshold) / (100 - this.settings.rsiShortThreshold);
-        } else {
-            signal.reason = `No signal: RSI=${indicators.RSI?.toFixed(2) || 'N/A'}, Green=${isGreenCandle}, Red=${isRedCandle}`;
+            signal.confidence = this.calculateConfidence(indicators, 'SHORT', isEMAResistance, isVolumeGood);
         }
 
         return signal;
     }
 
-    async applyFilters(signal, indicators, priceHistory) {
+    calculateConfidence(indicators, direction, trendConfirmation, volumeConfirmation) {
+        let confidence = 0.5; // Base confidence
+
+        // RSI strength
+        if (direction === 'LONG') {
+            confidence += (30 - indicators.RSI) / 30 * 0.2; // Max +0.2
+        } else {
+            confidence += (indicators.RSI - 70) / 30 * 0.2; // Max +0.2
+        }
+
+        // Trend confirmation
+        if (trendConfirmation) {
+            confidence += 0.15;
+        }
+
+        // Volume confirmation
+        if (volumeConfirmation) {
+            confidence += 0.1;
+        }
+
+        // MACD confirmation
+        if (indicators.MACD && indicators.MACDSignal) {
+            const macdBullish = indicators.MACD > indicators.MACDSignal;
+            if ((direction === 'LONG' && macdBullish) || (direction === 'SHORT' && !macdBullish)) {
+                confidence += 0.05;
+            }
+        }
+
+        return Math.min(Math.max(confidence, 0), 1);
+    }
+
+    async applySignalFilters(signal, indicators, priceHistory, marketData) {
+        const result = {
+            approved: true,
+            rejectionReason: '',
+            adjustedSignal: { ...signal }
+        };
+
         try {
-            // EMA Filter
-            if (this.settings.enableEMAFilter && indicators.EMA_20 && indicators.EMA_50) {
-                if (signal.action === 'LONG' && indicators.EMA_20 <= indicators.EMA_50) {
-                    logger.trade('EMA filter rejected LONG signal', {
-                        ema20: indicators.EMA_20,
-                        ema50: indicators.EMA_50
-                    });
-                    return false;
-                }
-                if (signal.action === 'SHORT' && indicators.EMA_20 >= indicators.EMA_50) {
-                    logger.trade('EMA filter rejected SHORT signal', {
-                        ema20: indicators.EMA_20,
-                        ema50: indicators.EMA_50
-                    });
-                    return false;
-                }
+            // Minimum confidence filter
+            if (signal.confidence < 0.6) {
+                result.approved = false;
+                result.rejectionReason = `Low confidence: ${signal.confidence.toFixed(2)}`;
+                return result;
             }
 
-            // Bollinger Bands Filter
-            if (this.settings.enableBBFilter && indicators.BB_Upper && indicators.BB_Lower) {
-                const currentPrice = priceHistory[priceHistory.length - 1].close;
-                const bbPosition = (currentPrice - indicators.BB_Lower) / (indicators.BB_Upper - indicators.BB_Lower);
+            // Market volatility filter
+            const volatility = this.calculateVolatility(priceHistory);
+            if (volatility > 0.05) { // 5% volatility threshold
+                result.approved = false;
+                result.rejectionReason = `High volatility: ${(volatility * 100).toFixed(2)}%`;
+                return result;
+            }
+
+            // Bollinger Bands filter (if enabled)
+            if (config.ENABLE_BB_FILTER && indicators.BB_Upper && indicators.BB_Lower) {
+                const bbPosition = (marketData.price - indicators.BB_Lower) / 
+                                 (indicators.BB_Upper - indicators.BB_Lower);
                 
-                // Look for breakout signals
-                if (signal.action === 'LONG' && bbPosition > 0.8) {
-                    logger.trade('BB filter rejected LONG signal - price too high in BB', {
-                        bbPosition: bbPosition.toFixed(2)
-                    });
-                    return false;
+                if (signal.side === 'LONG' && bbPosition > 0.8) {
+                    result.approved = false;
+                    result.rejectionReason = 'Price near BB upper band';
+                    return result;
                 }
-                if (signal.action === 'SHORT' && bbPosition < 0.2) {
-                    logger.trade('BB filter rejected SHORT signal - price too low in BB', {
-                        bbPosition: bbPosition.toFixed(2)
-                    });
-                    return false;
+                
+                if (signal.side === 'SHORT' && bbPosition < 0.2) {
+                    result.approved = false;
+                    result.rejectionReason = 'Price near BB lower band';
+                    return result;
                 }
             }
 
-            // Volume filter
-            if (indicators.VolumeRatio && indicators.VolumeRatio < 1.2) {
-                logger.trade('Volume filter rejected signal - low volume', {
-                    volumeRatio: indicators.VolumeRatio.toFixed(2)
-                });
-                return false;
+            // EMA filter (if enabled)
+            if (config.ENABLE_EMA_FILTER && indicators.EMA_12 && indicators.EMA_26) {
+                const emaTrend = indicators.EMA_12 > indicators.EMA_26 ? 'BULLISH' : 'BEARISH';
+                
+                if (signal.side === 'LONG' && emaTrend === 'BEARISH') {
+                    result.approved = false;
+                    result.rejectionReason = 'EMA trend bearish for long signal';
+                    return result;
+                }
+                
+                if (signal.side === 'SHORT' && emaTrend === 'BULLISH') {
+                    result.approved = false;
+                    result.rejectionReason = 'EMA trend bullish for short signal';
+                    return result;
+                }
             }
 
-            return true;
+            // Time-based filter (avoid low liquidity hours)
+            const hour = new Date().getUTCHours();
+            if (hour >= 22 || hour <= 4) { // 22:00 - 04:00 UTC
+                result.approved = false;
+                result.rejectionReason = 'Low liquidity hours';
+                return result;
+            }
+
+            // AI confirmation (if available)
+            if (this.aiAnalyzer && config.ENABLE_AI_ANALYSIS) {
+                const aiAnalysis = await this.getAIConfirmation(signal);
+                if (aiAnalysis && aiAnalysis.confidence < config.AI_CONFIDENCE_THRESHOLD) {
+                    result.approved = false;
+                    result.rejectionReason = `AI confidence too low: ${aiAnalysis.confidence.toFixed(2)}`;
+                    return result;
+                }
+            }
+
+            logger.trade('✅ Signal passed all filters', {
+                action: signal.action,
+                confidence: signal.confidence,
+                filters: 'all_passed'
+            });
 
         } catch (error) {
-            logger.error('Error applying filters:', error);
-            return false;
+            logger.error('Error applying signal filters:', error);
+            result.approved = false;
+            result.rejectionReason = 'Filter error';
+        }
+
+        return result;
+    }
+
+    calculateVolatility(priceHistory) {
+        if (priceHistory.length < 10) return 0;
+        
+        const returns = [];
+        for (let i = 1; i < priceHistory.length; i++) {
+            const return_ = (priceHistory[i].close - priceHistory[i-1].close) / priceHistory[i-1].close;
+            returns.push(return_);
+        }
+        
+        const mean = returns.reduce((sum, r) => sum + r, 0) / returns.length;
+        const variance = returns.reduce((sum, r) => sum + Math.pow(r - mean, 2), 0) / returns.length;
+        
+        return Math.sqrt(variance);
+    }
+
+    async getAIConfirmation(signal) {
+        try {
+            if (!this.aiAnalyzer) return null;
+            
+            const analysis = await this.aiAnalyzer.analyzeMarket(
+                this.settings.symbol,
+                this.marketAnalyzer.getMarketData(this.settings.symbol),
+                this.marketAnalyzer.getTechnicalIndicators(this.settings.symbol),
+                this.marketAnalyzer.getPriceHistory(this.settings.symbol, 100)
+            );
+            
+            return analysis;
+        } catch (error) {
+            logger.error('Error getting AI confirmation:', error);
+            return null;
         }
     }
 
     async executeEntry(signal, currentPrice) {
         try {
-            const positionSide = signal.action; // 'LONG' or 'SHORT'
-            const side = signal.action === 'LONG' ? 'BUY' : 'SELL';
-            
-            // Calculate quantity
-            const quantity = this.calculateQuantity(currentPrice);
-            
-            if (!quantity || quantity <= 0) {
-                logger.error('Invalid quantity calculated', { quantity, currentPrice });
+            logger.trade('🎯 Executing entry signal', signal);
+
+            // Final balance validation
+            const balance = await this.validateAccountBalance();
+            if (balance < this.settings.minBalance) {
+                logger.trade('Insufficient balance for entry', { balance, required: this.settings.minBalance });
                 return;
             }
 
-            // Place market order
-            const order = await this.binanceAPI.placeFuturesOrder({
+            // Calculate position size with risk management
+            const positionSize = this.calculatePositionSize(currentPrice, balance);
+            if (positionSize < 0.001) {
+                logger.trade('Position size too small', { positionSize });
+                return;
+            }
+
+            // Calculate stop loss and take profit
+            const { stopLoss, takeProfit } = this.calculateStopLossAndTakeProfit(signal, currentPrice);
+
+            // Prepare order parameters
+            const orderParams = {
                 symbol: this.settings.symbol,
-                side: side,
+                side: signal.side === 'LONG' ? 'BUY' : 'SELL',
                 type: 'MARKET',
-                quantity: quantity,
-                positionSide: positionSide,
-                reduceOnly: false
+                quantity: positionSize.toFixed(3),
+                timeInForce: 'GTC'
+            };
+
+            logger.trade('📝 Order parameters', {
+                ...orderParams,
+                stopLoss,
+                takeProfit,
+                expectedValue: (positionSize * currentPrice).toFixed(2)
             });
 
-            if (!order) {
-                logger.error('Failed to place entry order');
-                return;
-            }
-
-            logger.trade('Entry order placed', {
+            // Execute market order
+            const order = await this.binanceFuturesAPI.placeOrder(orderParams);
+            
+            logger.trade('✅ Entry order executed', {
                 orderId: order.orderId,
-                side: positionSide,
-                quantity: quantity,
-                price: currentPrice,
-                reason: signal.reason
+                symbol: order.symbol,
+                side: order.side,
+                quantity: order.origQty,
+                price: order.avgPrice || currentPrice
             });
 
-            // Place TP and SL orders
-            await this.placeTPSLOrders(positionSide, currentPrice, quantity);
+            // Set stop loss order
+            await this.setStopLoss(signal.side, stopLoss, positionSize);
 
-            // Send Telegram notification
-            this.sendTelegramNotification(`🚀 ${positionSide} ENTRY\n\n` +
-                `Symbol: ${this.settings.symbol}\n` +
-                `Price: $${currentPrice}\n` +
-                `Quantity: ${quantity}\n` +
-                `Leverage: ${this.settings.leverage}x\n` +
-                `Reason: ${signal.reason}\n` +
-                `Confidence: ${(signal.confidence * 100).toFixed(1)}%`
-            );
+            // Set take profit order
+            await this.setTakeProfit(signal.side, takeProfit, positionSize);
 
-            this.dailyStats.trades++;
+            // Update tracking
+            this.updatePositionEntry(order, signal, stopLoss, takeProfit);
+
+            // Emit event
+            this.emit('positionOpened', {
+                orderId: order.orderId,
+                symbol: order.symbol,
+                side: signal.side,
+                size: positionSize,
+                entryPrice: order.avgPrice || currentPrice,
+                stopLoss,
+                takeProfit,
+                signal
+            });
 
         } catch (error) {
-            logger.error('Failed to execute entry:', error);
-            this.sendTelegramNotification(`❌ Entry Failed: ${error.message}`);
+            logger.error('❌ Failed to execute entry:', error);
+            
+            // Don't throw error, handle gracefully
+            this.handleExecutionError(error, signal);
         }
     }
 
-    async placeTPSLOrders(positionSide, entryPrice, quantity) {
-        try {
-            const isLong = positionSide === 'LONG';
-            
-            // Calculate TP and SL prices
-            let tpPrice, slPrice;
-            
-            if (this.settings.roiBasedTP) {
-                // ROI-based TP calculation
-                const targetROI = this.settings.takeProfitPercent / this.settings.leverage;
-                tpPrice = isLong ? 
-                    entryPrice * (1 + targetROI / 100) : 
-                    entryPrice * (1 - targetROI / 100);
-            } else {
-                // Standard percentage-based TP
-                tpPrice = isLong ? 
-                    entryPrice * (1 + this.settings.takeProfitPercent / 100) : 
-                    entryPrice * (1 - this.settings.takeProfitPercent / 100);
-            }
-            
-            slPrice = isLong ? 
-                entryPrice * (1 - this.settings.stopLossPercent / 100) : 
-                entryPrice * (1 + this.settings.stopLossPercent / 100);
-
-            // Round prices according to symbol precision
-            const symbolInfo = await this.binanceAPI.getSymbolInfo(this.settings.symbol);
-            const pricePrecision = symbolInfo?.pricePrecision || 2;
-            
-            tpPrice = parseFloat(tpPrice.toFixed(pricePrecision));
-            slPrice = parseFloat(slPrice.toFixed(pricePrecision));
-
-            // Place Take Profit order
-            const tpOrder = await this.binanceAPI.placeFuturesOrder({
-                symbol: this.settings.symbol,
-                side: isLong ? 'SELL' : 'BUY',
-                type: 'TAKE_PROFIT_MARKET',
-                quantity: quantity,
-                stopPrice: tpPrice,
-                positionSide: positionSide,
-                reduceOnly: true,
-                timeInForce: 'GTC'
+    calculatePositionSize(currentPrice, balance) {
+        // Use a percentage of balance for position sizing
+        const riskPercent = 0.02; // Risk 2% of balance per trade
+        const riskAmount = balance * riskPercent;
+        
+        // Calculate position size based on stop loss distance
+        const stopLossDistance = this.settings.slPercent / 100;
+        const maxPositionValue = riskAmount / stopLossDistance;
+        
+        // Convert to quantity
+        let positionSize = maxPositionValue / currentPrice;
+        
+        // Apply maximum position size limit
+        const maxPositionValue_limit = (this.settings.qtyUsdt / this.settings.leverage);
+        const maxQuantity = maxPositionValue_limit / currentPrice;
+        
+        positionSize = Math.min(positionSize, maxQuantity);
+        
+        // Apply minimum notional value (Binance requirement)
+        const minNotional = 5; // $5 minimum
+        const minQuantity = minNotional / currentPrice;
+        
+        if (positionSize < minQuantity) {
+            logger.trade('Position size below minimum notional', {
+                calculated: positionSize,
+                minimum: minQuantity,
+                minNotional
             });
-
-            // Place Stop Loss order
-            const slOrder = await this.binanceAPI.placeFuturesOrder({
-                symbol: this.settings.symbol,
-                side: isLong ? 'SELL' : 'BUY',
-                type: 'STOP_MARKET',
-                quantity: quantity,
-                stopPrice: slPrice,
-                positionSide: positionSide,
-                reduceOnly: true,
-                timeInForce: 'GTC'
-            });
-
-            logger.trade('TP/SL orders placed', {
-                positionSide,
-                tpOrderId: tpOrder?.orderId,
-                slOrderId: slOrder?.orderId,
-                tpPrice,
-                slPrice
-            });
-
-            // Store order IDs for tracking
-            this.activePositions.set(positionSide, {
-                side: positionSide,
-                entryPrice,
-                quantity,
-                tpOrderId: tpOrder?.orderId,
-                slOrderId: slOrder?.orderId,
-                tpPrice,
-                slPrice,
-                timestamp: Date.now()
-            });
-
-        } catch (error) {
-            logger.error('Failed to place TP/SL orders:', error);
-            this.sendTelegramNotification(`⚠️ TP/SL Order Failed: ${error.message}`);
-        }
-    }
-
-    calculateQuantity(price) {
-        try {
-            // Calculate quantity based on USDT amount and leverage
-            const notionalValue = this.settings.qtyUSDT * this.settings.leverage;
-            const baseQuantity = notionalValue / price;
-            
-            // Round to appropriate precision
-            const symbolInfo = this.binanceAPI.getSymbolInfo(this.settings.symbol);
-            const quantityPrecision = symbolInfo?.quantityPrecision || 3;
-            
-            return parseFloat(baseQuantity.toFixed(quantityPrecision));
-            
-        } catch (error) {
-            logger.error('Error calculating quantity:', error);
             return 0;
         }
+
+        return positionSize;
     }
 
-    async updatePositions() {
+    calculateStopLossAndTakeProfit(signal, currentPrice) {
+        let stopLoss, takeProfit;
+
+        if (signal.side === 'LONG') {
+            stopLoss = currentPrice * (1 - this.settings.slPercent / 100);
+            takeProfit = currentPrice * (1 + this.settings.tpPercent / 100);
+        } else {
+            stopLoss = currentPrice * (1 + this.settings.slPercent / 100);
+            takeProfit = currentPrice * (1 - this.settings.tpPercent / 100);
+        }
+
+        return {
+            stopLoss: parseFloat(stopLoss.toFixed(this.getPricePrecision())),
+            takeProfit: parseFloat(takeProfit.toFixed(this.getPricePrecision()))
+        };
+    }
+
+    getPricePrecision() {
+        // Different symbols have different price precision
+        const precisionMap = {
+            'BTCUSDT': 2,
+            'ETHUSDT': 2,
+            'BNBUSDT': 3,
+            'ADAUSDT': 4,
+            'SOLUSDT': 3
+        };
+        
+        return precisionMap[this.settings.symbol] || 4;
+    }
+
+    async setStopLoss(side, stopLossPrice, quantity) {
         try {
-            const positions = await this.binanceAPI.getFuturesPositions(this.settings.symbol);
+            const stopLossParams = {
+                symbol: this.settings.symbol,
+                side: side === 'LONG' ? 'SELL' : 'BUY',
+                type: 'STOP_MARKET',
+                quantity: quantity.toFixed(3),
+                stopPrice: stopLossPrice,
+                timeInForce: 'GTC',
+                reduceOnly: true
+            };
+
+            const stopOrder = await this.binanceFuturesAPI.placeOrder(stopLossParams);
+            logger.trade('✅ Stop loss order placed', {
+                orderId: stopOrder.orderId,
+                stopPrice: stopLossPrice
+            });
+
+            return stopOrder;
+
+        } catch (error) {
+            logger.error('❌ Failed to set stop loss:', error);
+            throw error;
+        }
+    }
+
+    async setTakeProfit(side, takeProfitPrice, quantity) {
+        try {
+            const takeProfitParams = {
+                symbol: this.settings.symbol,
+                side: side === 'LONG' ? 'SELL' : 'BUY',
+                type: 'LIMIT',
+                quantity: quantity.toFixed(3),
+                price: takeProfitPrice,
+                timeInForce: 'GTC',
+                reduceOnly: true
+            };
+
+            const tpOrder = await this.binanceFuturesAPI.placeOrder(takeProfitParams);
+            logger.trade('✅ Take profit order placed', {
+                orderId: tpOrder.orderId,
+                price: takeProfitPrice
+            });
+
+            return tpOrder;
+
+        } catch (error) {
+            logger.error('❌ Failed to set take profit:', error);
+            throw error;
+        }
+    }
+
+    async monitorPositions(positions) {
+        for (const position of positions) {
+            try {
+                await this.monitorSinglePosition(position);
+            } catch (error) {
+                logger.error(`Error monitoring position ${position.symbol}:`, error);
+            }
+        }
+    }
+
+    async monitorSinglePosition(position) {
+        const currentPrice = this.marketAnalyzer.getMarketData(position.symbol)?.price;
+        if (!currentPrice) return;
+
+        const pnl = this.calculatePositionPnL(position, currentPrice);
+        const pnlPercent = (pnl / Math.abs(position.notional)) * 100;
+
+        // Log position status
+        logger.trade('📊 Position monitoring', {
+            symbol: position.symbol,
+            side: position.side,
+            size: position.size,
+            entryPrice: position.entryPrice,
+            currentPrice,
+            pnl: pnl.toFixed(2),
+            pnlPercent: pnlPercent.toFixed(2) + '%'
+        });
+
+        // Check for manual exit conditions
+        await this.checkManualExitConditions(position, currentPrice, pnlPercent);
+
+        // Update position tracking
+        this.updatePositionStatus(position, currentPrice, pnl);
+    }
+
+    calculatePositionPnL(position, currentPrice) {
+        const side = position.side === 'LONG' ? 1 : -1;
+        return side * parseFloat(position.size) * (currentPrice - parseFloat(position.entryPrice));
+    }
+
+    async checkManualExitConditions(position, currentPrice, pnlPercent) {
+        // Emergency exit on large losses (beyond stop loss)
+        if (pnlPercent < -10) {
+            logger.trade('🚨 Emergency exit triggered - large loss', {
+                symbol: position.symbol,
+                pnlPercent
+            });
+            await this.closePosition(position, 'emergency_exit');
+            return;
+        }
+
+        // Take partial profits on large gains
+        if (pnlPercent > 5 && !position.partialProfitTaken) {
+            logger.trade('💰 Taking partial profits', {
+                symbol: position.symbol,
+                pnlPercent
+            });
+            await this.takePartialProfit(position, 0.5); // Close 50%
+            return;
+        }
+
+        // Time-based exit (close after 24 hours)
+        const positionAge = Date.now() - position.timestamp;
+        if (positionAge > 24 * 60 * 60 * 1000) { // 24 hours
+            logger.trade('⏰ Time-based exit triggered', {
+                symbol: position.symbol,
+                ageHours: (positionAge / (60 * 60 * 1000)).toFixed(1)
+            });
+            await this.closePosition(position, 'time_exit');
+            return;
+        }
+    }
+
+    async closePosition(position, reason) {
+        try {
+            logger.trade('🔄 Closing position', { symbol: position.symbol, reason });
+
+            // Cancel existing orders first
+            await this.cancelAllOrders(position.symbol);
+
+            // Place market order to close position
+            const closeParams = {
+                symbol: position.symbol,
+                side: position.side === 'LONG' ? 'SELL' : 'BUY',
+                type: 'MARKET',
+                quantity: Math.abs(parseFloat(position.size)).toFixed(3),
+                reduceOnly: true
+            };
+
+            const closeOrder = await this.binanceFuturesAPI.placeOrder(closeParams);
             
-            this.activePositions.clear();
+            logger.trade('✅ Position closed', {
+                orderId: closeOrder.orderId,
+                symbol: closeOrder.symbol,
+                reason
+            });
+
+            // Update stats
+            this.updateTradeStats(position, closeOrder, reason);
+
+            // Emit event
+            this.emit('positionClosed', {
+                position,
+                closeOrder,
+                reason
+            });
+
+        } catch (error) {
+            logger.error('❌ Failed to close position:', error);
+        }
+    }
+
+    async takePartialProfit(position, percentage) {
+        try {
+            const partialSize = Math.abs(parseFloat(position.size)) * percentage;
             
-            if (positions && positions.length > 0) {
-                for (const position of positions) {
-                    const size = Math.abs(parseFloat(position.positionAmt));
-                    if (size > 0) {
-                        this.activePositions.set(position.positionSide, {
-                            side: position.positionSide,
-                            size: size,
-                            entryPrice: parseFloat(position.entryPrice),
-                            unrealizedPnl: parseFloat(position.unrealizedPnl),
-                            percentage: parseFloat(position.percentage)
-                        });
-                    }
+            const partialCloseParams = {
+                symbol: position.symbol,
+                side: position.side === 'LONG' ? 'SELL' : 'BUY',
+                type: 'MARKET',
+                quantity: partialSize.toFixed(3),
+                reduceOnly: true
+            };
+
+            const partialOrder = await this.binanceFuturesAPI.placeOrder(partialCloseParams);
+            
+            logger.trade('✅ Partial profit taken', {
+                orderId: partialOrder.orderId,
+                percentage: (percentage * 100) + '%',
+                size: partialSize
+            });
+
+            // Mark as partial profit taken
+            position.partialProfitTaken = true;
+
+        } catch (error) {
+            logger.error('❌ Failed to take partial profit:', error);
+        }
+    }
+
+    async cancelAllOrders(symbol) {
+        try {
+            await this.binanceFuturesAPI.cancelAllOpenOrders(symbol);
+            logger.trade('✅ All orders cancelled', { symbol });
+        } catch (error) {
+            logger.error('❌ Failed to cancel orders:', error);
+        }
+    }
+
+    async getActivePositions() {
+        try {
+            const positions = await this.binanceFuturesAPI.getPositions();
+            return positions.filter(pos => 
+                parseFloat(pos.positionAmt) !== 0 && 
+                pos.symbol === this.settings.symbol
+            ).map(pos => ({
+                symbol: pos.symbol,
+                side: parseFloat(pos.positionAmt) > 0 ? 'LONG' : 'SHORT',
+                size: pos.positionAmt,
+                entryPrice: pos.entryPrice,
+                markPrice: pos.markPrice,
+                pnl: pos.unRealizedProfit,
+                roe: pos.percentage,
+                notional: Math.abs(parseFloat(pos.notional)),
+                timestamp: Date.now()
+            }));
+        } catch (error) {
+            logger.error('Error getting active positions:', error);
+            return [];
+        }
+    }
+
+    async stop() {
+        try {
+            logger.trade('🛑 Stopping Futures Strategy...');
+
+            this.isRunning = false;
+
+            // Stop all monitoring jobs
+            if (this.signalCheckJob) {
+                this.signalCheckJob.stop();
+                this.signalCheckJob = null;
+            }
+
+            if (this.performanceJob) {
+                this.performanceJob.stop();
+                this.performanceJob = null;
+            }
+
+            if (this.riskCheckJob) {
+                this.riskCheckJob.stop();
+                this.riskCheckJob = null;
+            }
+
+            // Cancel all open orders
+            try {
+                await this.cancelAllOrders(this.settings.symbol);
+            } catch (error) {
+                logger.error('Error cancelling orders during stop:', error);
+            }
+
+            this.emit('stopped');
+            logger.trade('✅ Futures Strategy stopped');
+
+        } catch (error) {
+            logger.error('❌ Error stopping strategy:', error);
+        }
+    }
+
+    async closeAllPositions(reason = 'manual_stop') {
+        try {
+            const positions = await this.getActivePositions();
+            
+            logger.trade('🔄 Closing all positions', { 
+                count: positions.length, 
+                reason 
+            });
+
+            for (const position of positions) {
+                await this.closePosition(position, reason);
+                // Small delay between closes
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+
+            logger.trade('✅ All positions closed');
+
+        } catch (error) {
+            logger.error('❌ Error closing all positions:', error);
+        }
+    }
+
+    // Helper methods for tracking and stats
+    updatePositionEntry(order, signal, stopLoss, takeProfit) {
+        const positionData = {
+            orderId: order.orderId,
+            symbol: order.symbol,
+            side: signal.side,
+            size: order.origQty,
+            entryPrice: order.avgPrice || signal.entryPrice,
+            stopLoss,
+            takeProfit,
+            signal: signal.reason,
+            timestamp: Date.now(),
+            partialProfitTaken: false
+        };
+
+        this.activePositions.set(order.orderId, positionData);
+        this.dailyStats.trades++;
+    }
+
+    updatePositionStatus(position, currentPrice, pnl) {
+        // Update position tracking with current status
+        // This can be used for more detailed monitoring
+    }
+
+    updatePositionTracking(positions) {
+        // Update internal position tracking
+        this.emit('positionsUpdate', {
+            timestamp: Date.now(),
+            positions: positions,
+            hasPositions: positions.length > 0
+        });
+    }
+
+    updateTradeStats(position, closeOrder, reason) {
+        const pnl = parseFloat(closeOrder.cumQuote || '0');
+        
+        this.dailyStats.pnl += pnl;
+        this.dailyStats.currentBalance += pnl;
+
+        if (pnl > 0) {
+            this.dailyStats.wins++;
+            this.dailyStats.maxProfit = Math.max(this.dailyStats.maxProfit, pnl);
+            this.consecutiveLosses = 0; // Reset consecutive losses
+        } else {
+            this.dailyStats.losses++;
+            this.dailyStats.maxLoss = Math.min(this.dailyStats.maxLoss, pnl);
+            this.consecutiveLosses++;
+        }
+
+        logger.trade('📊 Trade completed', {
+            symbol: position.symbol,
+            side: position.side,
+            pnl: pnl.toFixed(2),
+            reason,
+            dailyPnl: this.dailyStats.pnl.toFixed(2),
+            winRate: ((this.dailyStats.wins / this.dailyStats.trades) * 100).toFixed(1) + '%'
+        });
+
+        // Remove from active positions
+        this.activePositions.delete(position.orderId);
+    }
+
+    async performRiskChecks() {
+        try {
+            // Update account balance
+            await this.validateAccountBalance();
+
+            // Check for unusual market conditions
+            const marketData = this.marketAnalyzer.getMarketData(this.settings.symbol);
+            if (marketData) {
+                const priceChange = Math.abs(parseFloat(marketData.priceChangePercent));
+                if (priceChange > 10) { // 10% price change
+                    logger.trade('⚠️ High market volatility detected', {
+                        symbol: this.settings.symbol,
+                        priceChange: priceChange + '%'
+                    });
                 }
             }
 
         } catch (error) {
-            logger.error('Error updating positions:', error);
+            logger.error('Error in risk checks:', error);
         }
     }
 
-    async closeAllPositions() {
+    async updatePerformanceMetrics() {
         try {
-            await this.updatePositions();
-            
-            for (const [positionSide, position] of this.activePositions) {
-                await this.closePosition(positionSide, 'manual');
-            }
-            
-        } catch (error) {
-            logger.error('Error closing all positions:', error);
-        }
-    }
+            const metrics = {
+                timestamp: Date.now(),
+                dailyStats: { ...this.dailyStats },
+                winRate: this.dailyStats.trades > 0 ? 
+                        (this.dailyStats.wins / this.dailyStats.trades * 100).toFixed(2) + '%' : '0%',
+                avgProfitPerTrade: this.dailyStats.trades > 0 ? 
+                                  (this.dailyStats.pnl / this.dailyStats.trades).toFixed(2) : '0',
+                consecutiveLosses: this.consecutiveLosses,
+                activePositions: this.activePositions.size
+            };
 
-    async closePosition(positionSide, reason = 'manual') {
-        try {
-            const position = this.activePositions.get(positionSide);
-            if (!position) {
-                return;
-            }
-
-            // Cancel existing TP/SL orders
-            if (position.tpOrderId) {
-                await this.binanceAPI.cancelFuturesOrder(this.settings.symbol, position.tpOrderId);
-            }
-            if (position.slOrderId) {
-                await this.binanceAPI.cancelFuturesOrder(this.settings.symbol, position.slOrderId);
-            }
-
-            // Close position with market order
-            const closeOrder = await this.binanceAPI.placeFuturesOrder({
-                symbol: this.settings.symbol,
-                side: positionSide === 'LONG' ? 'SELL' : 'BUY',
-                type: 'MARKET',
-                quantity: position.size,
-                positionSide: positionSide,
-                reduceOnly: true
-            });
-
-            if (closeOrder) {
-                logger.trade('Position closed', {
-                    positionSide,
-                    reason,
-                    orderId: closeOrder.orderId,
-                    pnl: position.unrealizedPnl
-                });
-
-                // Update daily PnL
-                this.dailyStats.pnl += position.unrealizedPnl || 0;
-
-                // Send notification
-                const pnlEmoji = position.unrealizedPnl > 0 ? '✅' : '❌';
-                this.sendTelegramNotification(`${pnlEmoji} ${positionSide} CLOSED\n\n` +
-                    `Reason: ${reason}\n` +
-                    `PnL: $${position.unrealizedPnl?.toFixed(2) || '0.00'}\n` +
-                    `Daily PnL: $${this.dailyStats.pnl.toFixed(2)}`
-                );
-
-                // Remove from active positions
-                this.activePositions.delete(positionSide);
-            }
+            logger.trade('📊 Performance update', metrics);
+            this.emit('performanceUpdate', metrics);
 
         } catch (error) {
-            logger.error(`Error closing ${positionSide} position:`, error);
+            logger.error('Error updating performance metrics:', error);
         }
     }
 
-    async checkDailyLimits() {
-        try {
-            // Reset daily stats if new day
-            const today = new Date().toDateString();
-            if (today !== this.dailyStats.lastResetDate) {
-                await this.resetDailyStats();
-            }
-
-            // Check if target profit reached
-            if (this.dailyStats.pnl >= this.dailyStats.targetProfit) {
-                logger.trade('Daily target profit reached, stopping trading', {
-                    currentPnL: this.dailyStats.pnl,
-                    target: this.dailyStats.targetProfit
-                });
-                
-                this.sendTelegramNotification(`🎯 Daily Target Reached!\n\n` +
-                    `Target: $${this.dailyStats.targetProfit.toFixed(2)}\n` +
-                    `Current: $${this.dailyStats.pnl.toFixed(2)}\n` +
-                    `Trading stopped for today.`
-                );
-                
-                await this.stop();
-                return true;
-            }
-
-            // Check if max loss reached
-            if (this.dailyStats.pnl <= -this.dailyStats.maxLoss) {
-                logger.trade('Daily max loss reached, stopping trading', {
-                    currentPnL: this.dailyStats.pnl,
-                    maxLoss: this.dailyStats.maxLoss
-                });
-                
-                this.sendTelegramNotification(`🚨 Daily Loss Limit Hit!\n\n` +
-                    `Max Loss: $${this.dailyStats.maxLoss.toFixed(2)}\n` +
-                    `Current: $${this.dailyStats.pnl.toFixed(2)}\n` +
-                    `Trading stopped for today.`
-                );
-                
-                await this.closeAllPositions();
-                await this.stop();
-                return true;
-            }
-
-            return false;
-
-        } catch (error) {
-            logger.error('Error checking daily limits:', error);
-            return false;
-        }
-    }
-
-    async resetDailyStats() {
-        const today = new Date().toDateString();
+    async stopTradingForDay(reason) {
+        logger.trade('🛑 Stopping trading for the day', { reason });
         
-        // Send daily summary if it's not the first day
-        if (this.dailyStats.lastResetDate !== today && this.dailyStats.trades > 0) {
-            this.sendDailySummary();
+        this.emergencyStop = true;
+        
+        // Close all positions if configured
+        if (config.FORCE_CLOSE_ALL_ON_ERROR) {
+            await this.closeAllPositions(reason);
         }
 
-        // Get current balance
-        const account = await this.binanceAPI.getFuturesAccount();
-        const currentBalance = account ? parseFloat(account.totalWalletBalance) : this.dailyStats.startBalance;
-
-        this.dailyStats = {
-            pnl: 0,
-            trades: 0,
-            startBalance: currentBalance,
-            targetProfit: currentBalance * (this.settings.dailyTargetPercent / 100),
-            maxLoss: currentBalance * (this.settings.dailyMaxLossPercent / 100),
-            lastResetDate: today
-        };
-
-        logger.trade('Daily stats reset', this.dailyStats);
+        this.emit('dailyStop', { reason, stats: this.dailyStats });
     }
 
-    sendDailySummary() {
-        const winRate = this.dailyStats.trades > 0 ? 
-            (this.dailyStats.pnl > 0 ? 100 : 0) : 0; // Simplified win rate calculation
-
-        this.sendTelegramNotification(`📊 Daily Summary\n\n` +
-            `Total PnL: $${this.dailyStats.pnl.toFixed(2)}\n` +
-            `Total Trades: ${this.dailyStats.trades}\n` +
-            `Win Rate: ${winRate.toFixed(1)}%\n` +
-            `Start Balance: $${this.dailyStats.startBalance.toFixed(2)}\n` +
-            `ROI: ${((this.dailyStats.pnl / this.dailyStats.startBalance) * 100).toFixed(2)}%`
-        );
+    handleEmergencyStop() {
+        logger.trade('🚨 Emergency stop triggered by risk manager');
+        this.stopTradingForDay('risk_manager_emergency');
     }
 
-    isNewsHour() {
-        if (!this.settings.enableNewsFilter) {
-            return false;
+    handleSignalError(error) {
+        logger.error('Signal analysis error:', error);
+        
+        // Implement error-specific handling
+        if (error.message.includes('API')) {
+            logger.trade('⚠️ API error detected, pausing signal checks');
+            // Could implement temporary pause here
         }
-
-        const currentHour = new Date().getUTCHours();
-        return this.newsHours.includes(currentHour);
     }
 
-    sendTelegramNotification(message) {
-        // This will be handled by the main TelegramBot class
-        this.emit('notification', message);
+    handleExecutionError(error, signal) {
+        logger.error('Order execution error:', error);
+        
+        // Track execution errors
+        this.dailyStats.executionErrors = (this.dailyStats.executionErrors || 0) + 1;
+        
+        this.emit('executionError', { error, signal });
     }
 
-    // Getter methods
+    // Public methods for external control
     getStatus() {
         return {
             isRunning: this.isRunning,
-            symbol: this.settings.symbol,
-            leverage: this.settings.leverage,
-            activePositions: this.activePositions.size,
-            dailyPnL: this.dailyStats.pnl,
-            dailyTrades: this.dailyStats.trades,
-            settings: this.settings
+            emergencyStop: this.emergencyStop,
+            settings: this.settings,
+            dailyStats: this.dailyStats,
+            consecutiveLosses: this.consecutiveLosses,
+            activePositionsCount: this.activePositions.size,
+            lastSignalCheck: this.lastSignalCheck
         };
-    }
-
-    getActivePositions() {
-        return Array.from(this.activePositions.values());
     }
 
     getDailyStats() {
         return { ...this.dailyStats };
     }
 
-    // Settings update methods
-    updateSettings(newSettings) {
-        this.settings = { ...this.settings, ...newSettings };
-        logger.trade('Settings updated', newSettings);
+    getSettings() {
+        return { ...this.settings };
     }
 
-    cleanup() {
-        this.stop();
-        this.removeAllListeners();
-        logger.trade('Futures strategy cleanup completed');
+    updateSettings(newSettings) {
+        this.settings = { ...this.settings, ...newSettings };
+        logger.trade('Settings updated', this.settings);
     }
 }
 

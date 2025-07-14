@@ -1,0 +1,520 @@
+const crypto = require('crypto');
+const axios = require('axios');
+const logger = require('../utils/logger');
+
+class BinanceFuturesAPI {
+    constructor(config) {
+        this.apiKey = config.apiKey;
+        this.apiSecret = config.secretKey;
+        this.baseURL = config.useTestnet ? 
+            'https://testnet.binancefuture.com' : 
+            'https://fapi.binance.com';
+        
+        this.axiosInstance = axios.create({
+            baseURL: this.baseURL,
+            timeout: 10000,
+            headers: {
+                'X-MBX-APIKEY': this.apiKey
+            }
+        });
+
+        // Symbol info cache
+        this.symbolInfo = new Map();
+        this.isConnected = false;
+        
+        // Initialize symbol info
+        this.initializeSymbolInfo();
+    }
+
+    async initializeSymbolInfo() {
+        try {
+            const exchangeInfo = await this.getExchangeInfo();
+            for (const symbol of exchangeInfo.symbols) {
+                this.symbolInfo.set(symbol.symbol, {
+                    pricePrecision: symbol.pricePrecision,
+                    quantityPrecision: symbol.quantityPrecision,
+                    minQty: parseFloat(symbol.filters.find(f => f.filterType === 'LOT_SIZE')?.minQty || '0'),
+                    maxQty: parseFloat(symbol.filters.find(f => f.filterType === 'LOT_SIZE')?.maxQty || '0'),
+                    stepSize: parseFloat(symbol.filters.find(f => f.filterType === 'LOT_SIZE')?.stepSize || '0'),
+                    minPrice: parseFloat(symbol.filters.find(f => f.filterType === 'PRICE_FILTER')?.minPrice || '0'),
+                    maxPrice: parseFloat(symbol.filters.find(f => f.filterType === 'PRICE_FILTER')?.maxPrice || '0'),
+                    tickSize: parseFloat(symbol.filters.find(f => f.filterType === 'PRICE_FILTER')?.tickSize || '0')
+                });
+            }
+            this.isConnected = true;
+            logger.binance('Symbol info initialized');
+        } catch (error) {
+            logger.error(`Failed to set leverage for ${symbol}:`, error.message);
+            throw error;
+        }
+    }
+
+    // Set margin type (ISOLATED or CROSSED)
+    async setMarginType(symbol, marginType) {
+        try {
+            const params = { symbol, marginType };
+            const queryString = this.createAuthQuery(params);
+            const response = await this.axiosInstance.post(`/fapi/v1/marginType?${queryString}`);
+            
+            logger.binance('Margin type set', { symbol, marginType });
+            return response.data;
+        } catch (error) {
+            // Margin type might already be set, check if it's just a warning
+            if (error.response?.data?.code === -4046) {
+                logger.binance('Margin type already set', { symbol, marginType });
+                return { code: -4046, msg: 'No need to change margin type.' };
+            }
+            logger.error(`Failed to set margin type for ${symbol}:`, error.message);
+            throw error;
+        }
+    }
+
+    // Place futures order
+    async placeOrder(orderParams) {
+        try {
+            const {
+                symbol,
+                side,           // BUY or SELL
+                type,           // MARKET, LIMIT, STOP, TAKE_PROFIT, etc.
+                quantity,
+                price,
+                stopPrice,
+                positionSide,   // BOTH, LONG, SHORT (for hedge mode)
+                timeInForce,    // GTC, IOC, FOK
+                reduceOnly,     // true/false
+                newClientOrderId,
+                closePosition,
+                activationPrice,
+                callbackRate,
+                workingType,
+                priceProtect
+            } = orderParams;
+
+            // Validate required parameters
+            if (!symbol || !side || !type || !quantity) {
+                throw new Error('Missing required parameters: symbol, side, type, quantity');
+            }
+
+            const params = {
+                symbol,
+                side,
+                type,
+                quantity: this.roundQuantity(quantity, symbol)
+            };
+
+            // Add optional parameters
+            if (price) params.price = this.roundPrice(price, symbol);
+            if (stopPrice) params.stopPrice = this.roundPrice(stopPrice, symbol);
+            if (positionSide) params.positionSide = positionSide;
+            if (timeInForce) params.timeInForce = timeInForce;
+            if (reduceOnly !== undefined) params.reduceOnly = reduceOnly;
+            if (newClientOrderId) params.newClientOrderId = newClientOrderId;
+            if (closePosition !== undefined) params.closePosition = closePosition;
+            if (activationPrice) params.activationPrice = this.roundPrice(activationPrice, symbol);
+            if (callbackRate) params.callbackRate = callbackRate;
+            if (workingType) params.workingType = workingType;
+            if (priceProtect !== undefined) params.priceProtect = priceProtect;
+
+            const queryString = this.createAuthQuery(params);
+            const response = await this.axiosInstance.post(`/fapi/v1/order?${queryString}`);
+
+            logger.trade('Futures order placed successfully', {
+                orderId: response.data.orderId,
+                symbol: response.data.symbol,
+                side: response.data.side,
+                type: response.data.type,
+                quantity: response.data.origQty,
+                price: response.data.price,
+                status: response.data.status
+            });
+
+            return response.data;
+        } catch (error) {
+            logger.error('Failed to place futures order:', error.response?.data || error.message);
+            throw error;
+        }
+    }
+
+    // Cancel order
+    async cancelOrder(symbol, orderId, origClientOrderId = null) {
+        try {
+            const params = { symbol };
+            if (orderId) params.orderId = orderId;
+            if (origClientOrderId) params.origClientOrderId = origClientOrderId;
+
+            const queryString = this.createAuthQuery(params);
+            const response = await this.axiosInstance.delete(`/fapi/v1/order?${queryString}`);
+
+            logger.binance('Futures order cancelled', {
+                orderId: response.data.orderId,
+                symbol: response.data.symbol
+            });
+
+            return response.data;
+        } catch (error) {
+            logger.error('Failed to cancel futures order:', error.response?.data || error.message);
+            throw error;
+        }
+    }
+
+    // Cancel all orders for symbol
+    async cancelAllOrders(symbol) {
+        try {
+            const params = { symbol };
+            const queryString = this.createAuthQuery(params);
+            const response = await this.axiosInstance.delete(`/fapi/v1/allOpenOrders?${queryString}`);
+
+            logger.binance('All futures orders cancelled', { symbol });
+            return response.data;
+        } catch (error) {
+            logger.error('Failed to cancel all futures orders:', error.response?.data || error.message);
+            throw error;
+        }
+    }
+
+    // Get order status
+    async getOrder(symbol, orderId, origClientOrderId = null) {
+        try {
+            const params = { symbol };
+            if (orderId) params.orderId = orderId;
+            if (origClientOrderId) params.origClientOrderId = origClientOrderId;
+
+            const queryString = this.createAuthQuery(params);
+            const response = await this.axiosInstance.get(`/fapi/v1/order?${queryString}`);
+
+            return response.data;
+        } catch (error) {
+            logger.error('Failed to get futures order:', error.response?.data || error.message);
+            throw error;
+        }
+    }
+
+    // Get all orders for symbol
+    async getAllOrders(symbol, orderId = null, startTime = null, endTime = null, limit = 500) {
+        try {
+            const params = { symbol, limit };
+            if (orderId) params.orderId = orderId;
+            if (startTime) params.startTime = startTime;
+            if (endTime) params.endTime = endTime;
+
+            const queryString = this.createAuthQuery(params);
+            const response = await this.axiosInstance.get(`/fapi/v1/allOrders?${queryString}`);
+
+            logger.binance('All futures orders retrieved', {
+                symbol,
+                count: response.data.length
+            });
+
+            return response.data;
+        } catch (error) {
+            logger.error('Failed to get all futures orders:', error.response?.data || error.message);
+            throw error;
+        }
+    }
+
+    // Get open orders
+    async getOpenOrders(symbol = null) {
+        try {
+            const params = symbol ? { symbol } : {};
+            const queryString = this.createAuthQuery(params);
+            const response = await this.axiosInstance.get(`/fapi/v1/openOrders?${queryString}`);
+
+            logger.binance('Open futures orders retrieved', {
+                symbol: symbol || 'ALL',
+                count: response.data.length
+            });
+
+            return response.data;
+        } catch (error) {
+            logger.error('Failed to get open futures orders:', error.response?.data || error.message);
+            throw error;
+        }
+    }
+
+    // Get trade history
+    async getTradeHistory(symbol, startTime = null, endTime = null, limit = 500) {
+        try {
+            const params = { symbol, limit };
+            if (startTime) params.startTime = startTime;
+            if (endTime) params.endTime = endTime;
+
+            const queryString = this.createAuthQuery(params);
+            const response = await this.axiosInstance.get(`/fapi/v1/userTrades?${queryString}`);
+
+            logger.binance('Trade history retrieved', {
+                symbol,
+                count: response.data.length
+            });
+
+            return response.data;
+        } catch (error) {
+            logger.error('Failed to get trade history:', error.response?.data || error.message);
+            throw error;
+        }
+    }
+
+    // Get income history
+    async getIncomeHistory(symbol = null, incomeType = null, startTime = null, endTime = null, limit = 1000) {
+        try {
+            const params = { limit };
+            if (symbol) params.symbol = symbol;
+            if (incomeType) params.incomeType = incomeType;
+            if (startTime) params.startTime = startTime;
+            if (endTime) params.endTime = endTime;
+
+            const queryString = this.createAuthQuery(params);
+            const response = await this.axiosInstance.get(`/fapi/v1/income?${queryString}`);
+
+            return response.data;
+        } catch (error) {
+            logger.error('Failed to get income history:', error.response?.data || error.message);
+            throw error;
+        }
+    }
+
+    // Get symbol info
+    getSymbolInfo(symbol) {
+        return this.symbolInfo.get(symbol);
+    }
+
+    // Utility method to round price to symbol precision
+    roundPrice(price, symbol) {
+        const symbolInfo = this.getSymbolInfo(symbol);
+        if (symbolInfo && symbolInfo.tickSize) {
+            const precision = symbolInfo.pricePrecision;
+            return parseFloat(price.toFixed(precision));
+        }
+        return parseFloat(price.toFixed(4)); // Default precision
+    }
+
+    // Utility method to round quantity to symbol precision
+    roundQuantity(quantity, symbol) {
+        const symbolInfo = this.getSymbolInfo(symbol);
+        if (symbolInfo && symbolInfo.stepSize) {
+            const precision = symbolInfo.quantityPrecision;
+            return parseFloat(quantity.toFixed(precision));
+        }
+        return parseFloat(quantity.toFixed(3)); // Default precision
+    }
+
+    // WebSocket methods (basic setup)
+    createWebSocket(streams, callback) {
+        const WebSocket = require('ws');
+        const baseWsUrl = this.baseURL.replace('https://', 'wss://').replace('http://', 'ws://');
+        const wsUrl = `${baseWsUrl}/ws/${streams}`;
+
+        const ws = new WebSocket(wsUrl);
+
+        ws.on('open', () => {
+            logger.binance('WebSocket connected', { streams });
+        });
+
+        ws.on('message', (data) => {
+            try {
+                const parsedData = JSON.parse(data);
+                callback(parsedData);
+            } catch (error) {
+                logger.error('Failed to parse WebSocket data:', error.message);
+            }
+        });
+
+        ws.on('error', (error) => {
+            logger.error('WebSocket error:', error.message);
+        });
+
+        ws.on('close', () => {
+            logger.binance('WebSocket disconnected', { streams });
+        });
+
+        return ws;
+    }
+
+    // Start user data stream
+    async startUserDataStream() {
+        try {
+            const response = await this.axiosInstance.post('/fapi/v1/listenKey', {}, {
+                headers: { 'X-MBX-APIKEY': this.apiKey }
+            });
+
+            const listenKey = response.data.listenKey;
+            logger.binance('User data stream started', { listenKey: listenKey.substring(0, 10) + '...' });
+
+            return listenKey;
+        } catch (error) {
+            logger.error('Failed to start user data stream:', error.message);
+            throw error;
+        }
+    }
+
+    // Keep alive user data stream
+    async keepAliveUserDataStream(listenKey) {
+        try {
+            await this.axiosInstance.put('/fapi/v1/listenKey', {}, {
+                headers: { 'X-MBX-APIKEY': this.apiKey },
+                params: { listenKey }
+            });
+
+            logger.binance('User data stream kept alive');
+            return true;
+        } catch (error) {
+            logger.error('Failed to keep alive user data stream:', error.message);
+            throw error;
+        }
+    }
+
+    // Close user data stream
+    async closeUserDataStream(listenKey) {
+        try {
+            await this.axiosInstance.delete('/fapi/v1/listenKey', {
+                headers: { 'X-MBX-APIKEY': this.apiKey },
+                params: { listenKey }
+            });
+
+            logger.binance('User data stream closed');
+            return true;
+        } catch (error) {
+            logger.error('Failed to close user data stream:', error.message);
+            throw error;
+        }
+    }
+}
+
+module.exports = BinanceFuturesAPI;
+            logger.error('Failed to initialize symbol info:', error.message);
+        }
+    }
+
+    // Generate signature for authenticated requests
+    generateSignature(queryString) {
+        return crypto
+            .createHmac('sha256', this.apiSecret)
+            .update(queryString)
+            .digest('hex');
+    }
+
+    // Create query string with signature
+    createAuthQuery(params = {}) {
+        const timestamp = Date.now();
+        const queryParams = { ...params, timestamp };
+        
+        const queryString = Object.keys(queryParams)
+            .map(key => `${key}=${encodeURIComponent(queryParams[key])}`)
+            .join('&');
+            
+        const signature = this.generateSignature(queryString);
+        
+        return `${queryString}&signature=${signature}`;
+    }
+
+    // Test connectivity
+    async testConnectivity() {
+        try {
+            const response = await this.axiosInstance.get('/fapi/v1/ping');
+            logger.binance('Futures API connectivity test successful');
+            this.isConnected = true;
+            return response.status === 200;
+        } catch (error) {
+            logger.error('Futures API connectivity test failed:', error.message);
+            this.isConnected = false;
+            throw error;
+        }
+    }
+
+    // Get server time
+    async getServerTime() {
+        try {
+            const response = await this.axiosInstance.get('/fapi/v1/time');
+            return response.data.serverTime;
+        } catch (error) {
+            logger.error('Failed to get server time:', error.message);
+            throw error;
+        }
+    }
+
+    // Get exchange info
+    async getExchangeInfo() {
+        try {
+            const response = await this.axiosInstance.get('/fapi/v1/exchangeInfo');
+            return response.data;
+        } catch (error) {
+            logger.error('Failed to get exchange info:', error.message);
+            throw error;
+        }
+    }
+
+    // Get account information
+    async getAccount() {
+        try {
+            const queryString = this.createAuthQuery();
+            const response = await this.axiosInstance.get(`/fapi/v2/account?${queryString}`);
+            
+            logger.binance('Account info retrieved', {
+                totalWalletBalance: response.data.totalWalletBalance,
+                availableBalance: response.data.availableBalance
+            });
+            
+            return response.data;
+        } catch (error) {
+            logger.error('Failed to get account info:', error.message);
+            throw error;
+        }
+    }
+
+    // Get balance for specific asset
+    async getBalance(asset = 'USDT') {
+        try {
+            const account = await this.getAccount();
+            const balance = account.assets.find(a => a.asset === asset);
+            
+            return balance ? {
+                asset: balance.asset,
+                walletBalance: parseFloat(balance.walletBalance),
+                unrealizedPnL: parseFloat(balance.unrealizedPnL),
+                marginBalance: parseFloat(balance.marginBalance),
+                availableBalance: parseFloat(balance.availableBalance),
+                maxWithdrawAmount: parseFloat(balance.maxWithdrawAmount)
+            } : null;
+        } catch (error) {
+            logger.error(`Failed to get balance for ${asset}:`, error.message);
+            throw error;
+        }
+    }
+
+    // Get positions
+    async getPositions() {
+        try {
+            const queryString = this.createAuthQuery();
+            const response = await this.axiosInstance.get(`/fapi/v2/positionRisk?${queryString}`);
+            
+            // Filter only positions with non-zero size
+            const activePositions = response.data.filter(position => 
+                parseFloat(position.positionAmt) !== 0
+            );
+
+            logger.binance('Positions retrieved', {
+                total: response.data.length,
+                active: activePositions.length
+            });
+
+            return response.data; // Return all positions, not just active ones
+        } catch (error) {
+            logger.error('Failed to get positions:', error.message);
+            throw error;
+        }
+    }
+
+    // Set leverage for symbol
+    async setLeverage(symbol, leverage) {
+        try {
+            const params = { symbol, leverage };
+            const queryString = this.createAuthQuery(params);
+            const response = await this.axiosInstance.post(`/fapi/v1/leverage?${queryString}`);
+            
+            logger.binance('Leverage set', {
+                symbol,
+                leverage: response.data.leverage,
+                maxNotionalValue: response.data.maxNotionalValue
+            });
+            
+            return response.data;
+        } catch (error) {

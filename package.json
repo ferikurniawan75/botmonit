@@ -9,7 +9,7 @@
     "install-bot": "node install.js",
     "setup": "chmod +x setup.sh && ./setup.sh",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "test:config": "node -e \"require('./src/config/config'); console.log('✅ Configuration valid')\"",
+    "test:config": "node validate-config.js",
     "logs": "tail -f logs/combined.log",
     "logs:error": "tail -f logs/error.log",
     "logs:trading": "tail -f logs/trading.log",
@@ -29,7 +29,12 @@
     "clean": "rm -rf node_modules package-lock.json && npm install",
     "clean:logs": "rm -rf logs/*.log",
     "health": "curl -f http://localhost:3000/health || exit 1",
-    "validate": "npm run test:config && npm run health"
+    "validate": "node validate-config.js",
+    "fix:apply": "node apply-fixes.js",
+    "setup:complete": "./setup.sh",
+    "start:safe": "npm run test:config && npm start",
+    "backup:create": "./backup.sh",
+    "health:check": "curl -f http://localhost:3000/health || exit 1"
   },
   "keywords": [
     "cryptocurrency",

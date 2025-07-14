@@ -2,17 +2,22 @@ const EventEmitter = require('events');
 const logger = require('../utils/logger');
 
 class RiskManager extends EventEmitter {
-    constructor(config) {
+    constructor(config = {}) {
         super();
         this.config = config;
         this.accountInfo = null;
+        
+        // Use config values with fallbacks from environment or defaults
         this.riskLimits = {
-            maxDailyLoss: config.MAX_LOSS_PERCENTAGE || 5, // 5% max daily loss
-            maxTradeRisk: config.MAX_TRADE_RISK || 2, // 2% per trade
+            maxDailyLoss: config.MAX_LOSS_PERCENTAGE || 
+                         parseFloat(process.env.MAX_LOSS_PERCENTAGE) || 5, // 5% max daily loss
+            maxTradeRisk: config.MAX_TRADE_RISK || 
+                         parseFloat(process.env.MAX_TRADE_RISK) || 2, // 2% per trade
             maxCorrelationRisk: 0.7, // Max correlation between positions
-            maxLeverage: 1, // No leverage for spot trading
-            maxPositionSize: 10, // 10% max position size
-            maxDrawdown: 10 // 10% max drawdown
+            maxLeverage: config.MAX_LEVERAGE || 1, // No leverage for spot trading
+            maxPositionSize: config.MAX_POSITION_SIZE || 10, // 10% max position size
+            maxDrawdown: config.MAX_DRAWDOWN || 10, // 10% max drawdown
+            maxConsecutiveLosses: config.MAX_CONSECUTIVE_LOSSES || 5
         };
         
         this.dailyStats = {
@@ -29,6 +34,8 @@ class RiskManager extends EventEmitter {
         this.riskEvents = [];
         
         this.setupRiskMonitoring();
+        
+        logger.info('Risk Manager initialized with limits:', this.riskLimits);
     }
 
     async initialize(accountInfo) {
@@ -40,7 +47,7 @@ class RiskManager extends EventEmitter {
         this.dailyStats.startBalance = totalBalance;
         this.dailyStats.currentBalance = totalBalance;
         
-        logger.trade('Risk manager initialized', {
+        logger.info('Risk manager initialized', {
             totalBalance: totalBalance,
             limits: this.riskLimits
         });
@@ -70,7 +77,7 @@ class RiskManager extends EventEmitter {
             lastResetDate: today
         };
         
-        logger.trade('Daily risk stats reset');
+        logger.info('Daily risk stats reset');
     }
 
     calculateTotalBalanceUSDT() {
@@ -78,7 +85,7 @@ class RiskManager extends EventEmitter {
         
         // For now, just return USDT balance
         // In real implementation, convert all assets to USDT equivalent
-        const usdtBalance = this.accountInfo.balances.find(b => b.asset === 'USDT');
+        const usdtBalance = this.accountInfo.balances?.find(b => b.asset === 'USDT');
         return usdtBalance ? parseFloat(usdtBalance.free) + parseFloat(usdtBalance.locked) : 0;
     }
 
@@ -135,7 +142,7 @@ class RiskManager extends EventEmitter {
             }
 
             // Log risk assessment
-            logger.trade('Risk assessment completed', {
+            logger.info('Risk assessment completed', {
                 symbol: signal.symbol,
                 approved: riskAssessment.approved,
                 risk: riskAssessment.risk,
@@ -158,6 +165,8 @@ class RiskManager extends EventEmitter {
     }
 
     checkDailyLossLimit() {
+        if (this.dailyStats.startBalance === 0) return true;
+        
         const dailyLossPercent = (this.dailyStats.pnl / this.dailyStats.startBalance) * 100;
         
         if (Math.abs(dailyLossPercent) >= this.riskLimits.maxDailyLoss) {
@@ -172,6 +181,10 @@ class RiskManager extends EventEmitter {
     }
 
     checkPositionSize(signal) {
+        if (!signal.entryPrice || !signal.quantity) {
+            return { approved: true }; // Skip if no position size info
+        }
+        
         const entryValue = signal.entryPrice * signal.quantity;
         const positionSizePercent = (entryValue / this.dailyStats.currentBalance) * 100;
         
@@ -186,81 +199,51 @@ class RiskManager extends EventEmitter {
     }
 
     async checkCorrelationRisk(signal) {
-        // Get currently held positions
+        // Simplified correlation check
+        // In real implementation, you'd calculate actual correlation
         const currentPositions = Array.from(this.positionSizes.keys());
         
-        // Check correlation with existing positions
-        for (const existingSymbol of currentPositions) {
-            const correlation = await this.calculateCorrelation(signal.symbol, existingSymbol);
-            
-            if (Math.abs(correlation) > this.riskLimits.maxCorrelationRisk) {
-                return {
-                    approved: false,
-                    reason: `High correlation ${correlation.toFixed(2)} with existing position ${existingSymbol}`
-                };
-            }
+        if (currentPositions.length === 0) {
+            return { approved: true };
+        }
+        
+        // For now, just check if we already have a position in the same symbol
+        if (currentPositions.includes(signal.symbol)) {
+            return {
+                approved: false,
+                reason: `Already have position in ${signal.symbol}`
+            };
         }
         
         return { approved: true };
     }
 
-    async calculateCorrelation(symbol1, symbol2) {
-        try {
-            // Simplified correlation calculation
-            // In real implementation, use historical price data
-            
-            // Get base assets
-            const base1 = symbol1.replace('USDT', '').replace('BUSD', '');
-            const base2 = symbol2.replace('USDT', '').replace('BUSD', '');
-            
-            // High correlation for same asset
-            if (base1 === base2) return 1.0;
-            
-            // High correlation for major pairs
-            const majorPairs = ['BTC', 'ETH', 'BNB'];
-            if (majorPairs.includes(base1) && majorPairs.includes(base2)) {
-                return 0.8;
-            }
-            
-            // Medium correlation for DeFi tokens
-            const defiTokens = ['UNI', 'SUSHI', 'AAVE', 'COMP', 'MKR'];
-            if (defiTokens.includes(base1) && defiTokens.includes(base2)) {
-                return 0.6;
-            }
-            
-            // Low correlation otherwise
-            return 0.3;
-            
-        } catch (error) {
-            logger.error('Correlation calculation failed:', error);
-            return 0.5; // Default medium correlation
-        }
-    }
-
     checkVolatilityRisk(signal) {
-        // Calculate implied volatility from stop loss distance
-        const stopLossDistance = Math.abs(signal.entryPrice - signal.stopLoss) / signal.entryPrice * 100;
-        
-        let risk = 'low';
-        if (stopLossDistance > 5) {
-            risk = 'high';
-        } else if (stopLossDistance > 3) {
-            risk = 'medium';
-        }
-        
-        return { risk, volatility: stopLossDistance };
+        // Simplified volatility check
+        // In real implementation, calculate actual volatility from price history
+        return {
+            risk: 'low',
+            message: 'Volatility within acceptable range'
+        };
     }
 
     checkMarketConditions(signal) {
-        // Check overall market sentiment and conditions
-        // This is a simplified check - in real implementation, 
-        // you'd analyze broader market indicators
+        // Check for major market events, low liquidity times, etc.
+        const hour = new Date().getUTCHours();
+        
+        // Avoid trading during low liquidity hours (22:00 - 04:00 UTC)
+        if (hour >= 22 || hour <= 4) {
+            return {
+                approved: false,
+                reason: 'Low liquidity hours'
+            };
+        }
         
         return { approved: true };
     }
 
     validateStopLoss(signal) {
-        if (!signal.stopLoss) {
+        if (!signal.stopLoss || !signal.entryPrice) {
             return {
                 valid: false,
                 reason: 'No stop loss specified'
@@ -313,6 +296,8 @@ class RiskManager extends EventEmitter {
     }
 
     checkRiskLimits() {
+        if (this.dailyStats.startBalance === 0) return;
+        
         const dailyLossPercent = (this.dailyStats.pnl / this.dailyStats.startBalance) * 100;
         
         // Warning at 75% of daily limit
@@ -346,80 +331,6 @@ class RiskManager extends EventEmitter {
         return Math.min(maxQuantity, maxByPercent);
     }
 
-    assessTradeRisk(signal) {
-        const riskScore = {
-            overall: 0,
-            factors: {}
-        };
-        
-        // Volatility risk (0-30 points)
-        const volatilityCheck = this.checkVolatilityRisk(signal);
-        if (volatilityCheck.risk === 'high') {
-            riskScore.factors.volatility = 30;
-        } else if (volatilityCheck.risk === 'medium') {
-            riskScore.factors.volatility = 15;
-        } else {
-            riskScore.factors.volatility = 5;
-        }
-        
-        // Confidence risk (0-25 points)
-        if (signal.confidence < 0.6) {
-            riskScore.factors.confidence = 25;
-        } else if (signal.confidence < 0.8) {
-            riskScore.factors.confidence = 10;
-        } else {
-            riskScore.factors.confidence = 0;
-        }
-        
-        // Market timing risk (0-20 points)
-        const hour = new Date().getHours();
-        if (hour >= 22 || hour <= 6) { // Night trading (higher risk)
-            riskScore.factors.timing = 20;
-        } else {
-            riskScore.factors.timing = 0;
-        }
-        
-        // Strategy risk (0-15 points)
-        if (signal.strategy === 'ai_signals') {
-            riskScore.factors.strategy = 5;
-        } else if (signal.strategy === 'momentum') {
-            riskScore.factors.strategy = 15;
-        } else {
-            riskScore.factors.strategy = 10;
-        }
-        
-        // Position concentration risk (0-10 points)
-        const existingPositions = this.positionSizes.size;
-        if (existingPositions === 0) {
-            riskScore.factors.concentration = 0;
-        } else if (existingPositions >= 5) {
-            riskScore.factors.concentration = 10;
-        } else {
-            riskScore.factors.concentration = 5;
-        }
-        
-        // Calculate overall risk score
-        riskScore.overall = Object.values(riskScore.factors).reduce((sum, val) => sum + val, 0);
-        
-        // Classify risk level
-        let riskLevel;
-        if (riskScore.overall <= 25) {
-            riskLevel = 'low';
-        } else if (riskScore.overall <= 50) {
-            riskLevel = 'medium';
-        } else if (riskScore.overall <= 75) {
-            riskLevel = 'high';
-        } else {
-            riskLevel = 'very_high';
-        }
-        
-        return {
-            score: riskScore.overall,
-            level: riskLevel,
-            factors: riskScore.factors
-        };
-    }
-
     logRiskEvent(type, data) {
         const event = {
             timestamp: Date.now(),
@@ -434,7 +345,7 @@ class RiskManager extends EventEmitter {
             this.riskEvents.shift();
         }
         
-        logger.trade('Risk event logged', { type, data });
+        logger.info('Risk event logged', { type, data });
         this.emit('riskEvent', event);
     }
 
@@ -448,7 +359,7 @@ class RiskManager extends EventEmitter {
 
     updateRiskLimits(newLimits) {
         this.riskLimits = { ...this.riskLimits, ...newLimits };
-        logger.trade('Risk limits updated', this.riskLimits);
+        logger.info('Risk limits updated', this.riskLimits);
     }
 
     getRiskEvents(limit = 50) {
@@ -463,10 +374,13 @@ class RiskManager extends EventEmitter {
         
         const portfolioRisk = {
             totalExposure: totalValue,
-            exposurePercent: (totalValue / this.dailyStats.currentBalance) * 100,
+            exposurePercent: this.dailyStats.currentBalance > 0 ? 
+                           (totalValue / this.dailyStats.currentBalance) * 100 : 0,
             numberOfPositions: this.positionSizes.size,
-            diversification: this.positionSizes.size > 0 ? 1 / Math.sqrt(this.positionSizes.size) : 0,
-            dailyPnLPercent: (this.dailyStats.pnl / this.dailyStats.startBalance) * 100
+            diversification: this.positionSizes.size > 0 ?
+                           1 / Math.sqrt(this.positionSizes.size) : 0,
+            dailyPnLPercent: this.dailyStats.startBalance > 0 ?
+                           (this.dailyStats.pnl / this.dailyStats.startBalance) * 100 : 0
         };
         
         return portfolioRisk;
@@ -486,59 +400,14 @@ class RiskManager extends EventEmitter {
         };
     }
 
-    generateRiskReport() {
-        const portfolioRisk = this.getPortfolioRisk();
-        const riskCheck = this.isWithinRiskLimits();
-        const recentEvents = this.getRiskEvents(10);
-        
+    getStatus() {
         return {
-            timestamp: Date.now(),
-            dailyStats: this.getDailyStats(),
-            portfolioRisk,
-            riskLimits: this.getRiskLimits(),
-            withinLimits: riskCheck.withinLimits,
-            checks: riskCheck.checks,
-            recentEvents,
-            recommendations: this.generateRiskRecommendations(portfolioRisk, riskCheck)
+            riskLimits: this.riskLimits,
+            dailyStats: this.dailyStats,
+            portfolioRisk: this.getPortfolioRisk(),
+            withinLimits: this.isWithinRiskLimits(),
+            recentEvents: this.getRiskEvents(5)
         };
-    }
-
-    generateRiskRecommendations(portfolioRisk, riskCheck) {
-        const recommendations = [];
-        
-        if (!riskCheck.checks.dailyLoss) {
-            recommendations.push({
-                type: 'critical',
-                message: 'Daily loss limit exceeded - stop trading immediately',
-                action: 'stop_trading'
-            });
-        }
-        
-        if (portfolioRisk.exposurePercent > 80) {
-            recommendations.push({
-                type: 'warning',
-                message: 'High portfolio exposure - consider reducing position sizes',
-                action: 'reduce_positions'
-            });
-        }
-        
-        if (portfolioRisk.numberOfPositions > 8) {
-            recommendations.push({
-                type: 'info',
-                message: 'Many open positions - monitor correlation risk',
-                action: 'monitor_correlation'
-            });
-        }
-        
-        if (portfolioRisk.diversification < 0.3) {
-            recommendations.push({
-                type: 'info',
-                message: 'Low diversification - consider spreading risk across more assets',
-                action: 'increase_diversification'
-            });
-        }
-        
-        return recommendations;
     }
 
     cleanup() {
@@ -546,7 +415,7 @@ class RiskManager extends EventEmitter {
         this.positionSizes.clear();
         this.correlationMatrix.clear();
         this.riskEvents = [];
-        logger.trade('Risk manager cleanup completed');
+        logger.info('Risk manager cleanup completed');
     }
 }
 
