@@ -1,0 +1,1245 @@
+const EventEmitter = require('events');
+const { v4: uuidv4 } = require('uuid');
+const cron = require('cron');
+const logger = require('../utils/logger');
+const config = require('../config/config');
+
+class TradingBot extends EventEmitter {
+    constructor({ binanceAPI, marketAnalyzer, aiAnalyzer, riskManager, config: botConfig }) {
+        super();
+        
+        this.binanceAPI = binanceAPI;
+        this.marketAnalyzer = marketAnalyzer;
+        this.aiAnalyzer = aiAnalyzer;
+        this.riskManager = riskManager;
+        this.config = botConfig;
+        
+        this.isRunning = false;
+        this.activeTrades = new Map();
+        this.tradeHistory = [];
+        this.tradingMode = 'balanced';
+        this.enabledStrategies = new Set(['ai_signals', 'technical_analysis', 'momentum']);
+        
+        this.statistics = {
+            totalTrades: 0,
+            winningTrades: 0,
+            losingTrades: 0,
+            totalPnL: 0,
+            winRate: 0,
+            averageReturn: 0,
+            maxDrawdown: 0,
+            sharpeRatio: 0
+        };
+        
+        this.cronJobs = new Map();
+        this.setupEventHandlers();
+    }
+
+    setupEventHandlers() {
+        // Market analysis events
+        this.marketAnalyzer.on('marketAnalysis', (data) => {
+            this.handleMarketAnalysis(data);
+        });
+
+        this.marketAnalyzer.on('comprehensiveAnalysis', (data) => {
+            this.handleComprehensiveAnalysis(data);
+        });
+
+        // Binance events (only if API is available)
+        if (this.binanceAPI) {
+            this.binanceAPI.on('executionReport', (report) => {
+                this.handleExecutionReport(report);
+            });
+
+            this.binanceAPI.on('balanceUpdate', (update) => {
+                this.handleBalanceUpdate(update);
+            });
+        }
+
+        // Error handling
+        this.on('error', (error) => {
+            logger.error('TradingBot error:', error);
+        });
+    }
+
+    async start() {
+        if (this.isRunning) {
+            logger.trade('TradingBot already running');
+            return;
+        }
+
+        try {
+            logger.trade('Starting TradingBot...');
+
+            // Skip initialization if no API keys (for testing)
+            if (this.config.BINANCE_API_KEY && this.config.BINANCE_SECRET_KEY) {
+                try {
+                    await this.initialize();
+                } catch (error) {
+                    logger.error('Failed to initialize with API keys, running in demo mode:', error.message);
+                }
+            } else {
+                logger.trade('Running in demo mode (no API keys provided)');
+            }
+
+            // Start monitoring trades
+            this.startTradeMonitoring();
+
+            // Start periodic analysis
+            this.startPeriodicAnalysis();
+
+            // Start user data stream only if API is available and working
+            if (this.binanceAPI && this.config.BINANCE_API_KEY) {
+                try {
+                    this.binanceAPI.startUserDataStream();
+                } catch (error) {
+                    logger.error('Failed to start user data stream:', error.message);
+                }
+            }
+
+            this.isRunning = true;
+            logger.trade('TradingBot started successfully');
+
+            this.emit('started');
+
+        } catch (error) {
+            logger.error('Failed to start TradingBot:', error);
+            // Don't throw error, allow bot to continue in limited mode
+        }
+    }
+
+    async stop() {
+        if (!this.isRunning) {
+            logger.trade('TradingBot already stopped');
+            return;
+        }
+
+        try {
+            logger.trade('Stopping TradingBot...');
+
+            // Close all active trades
+            await this.closeAllTrades('bot_shutdown');
+
+            // Stop cron jobs
+            this.stopCronJobs();
+
+            // Stop data streams
+            if (this.binanceAPI) {
+                this.binanceAPI.stopAllStreams();
+            }
+
+            this.isRunning = false;
+            logger.trade('TradingBot stopped successfully');
+
+            this.emit('stopped');
+
+        } catch (error) {
+            logger.error('Error stopping TradingBot:', error);
+        }
+    }
+
+    async initialize() {
+        try {
+            // Get account info (skip if API fails)
+            let accountInfo = null;
+            try {
+                accountInfo = await this.binanceAPI.getAccountInfo();
+                if (!accountInfo) {
+                    throw new Error('Failed to get account information');
+                }
+            } catch (error) {
+                logger.error('Failed to get account info, continuing without:', error.message);
+                return; // Skip rest of initialization
+            }
+
+            // Validate trading pairs
+            await this.validateTradingPairs();
+
+            // Initialize risk management
+            if (this.riskManager && accountInfo) {
+                await this.riskManager.initialize(accountInfo);
+            }
+
+            logger.trade('TradingBot initialized', {
+                tradingPairs: this.config.TRADING_PAIRS?.length || 0,
+                tradingMode: this.tradingMode,
+                strategies: Array.from(this.enabledStrategies)
+            });
+        } catch (error) {
+            logger.error('Initialization error:', error);
+            throw error;
+        }
+    }
+
+    async validateTradingPairs() {
+        try {
+            const exchangeInfo = await this.binanceAPI.getExchangeInfo();
+            if (!exchangeInfo) {
+                throw new Error('Failed to get exchange information');
+            }
+
+            const availableSymbols = exchangeInfo.symbols
+                .filter(s => s.status === 'TRADING')
+                .map(s => s.symbol);
+
+            const tradingPairs = this.config.TRADING_PAIRS || ['BTCUSDT', 'ETHUSDT'];
+            const validPairs = tradingPairs.filter(pair => 
+                availableSymbols.includes(pair)
+            );
+
+            if (validPairs.length === 0) {
+                throw new Error('No valid trading pairs found');
+            }
+
+            logger.trade('Trading pairs validated', {
+                total: tradingPairs.length,
+                valid: validPairs.length,
+                invalid: tradingPairs.length - validPairs.length
+            });
+        } catch (error) {
+            logger.error('Failed to validate trading pairs:', error);
+        }
+    }
+
+    startTradeMonitoring() {
+        // Monitor trades every 10 seconds
+        const monitorJob = new cron.CronJob('*/10 * * * * *', () => {
+            this.monitorActiveTrades();
+        }, null, true, 'UTC');
+        
+        this.cronJobs.set('tradeMonitoring', monitorJob);
+        logger.trade('Trade monitoring started');
+    }
+
+    startPeriodicAnalysis() {
+        // Comprehensive analysis every 5 minutes
+        const analysisJob = new cron.CronJob('0 */5 * * * *', () => {
+            this.performPeriodicAnalysis();
+        }, null, true, 'UTC');
+        
+        this.cronJobs.set('periodicAnalysis', analysisJob);
+        logger.trade('Periodic analysis started');
+    }
+
+    stopCronJobs() {
+        this.cronJobs.forEach((job, name) => {
+            job.stop();
+            logger.trade(`Stopped cron job: ${name}`);
+        });
+        this.cronJobs.clear();
+    }
+
+    async monitorActiveTrades() {
+        if (this.activeTrades.size === 0) return;
+
+        try {
+            for (const [tradeId, trade] of this.activeTrades.entries()) {
+                await this.updateTradeStatus(trade);
+                await this.checkTradeConditions(trade);
+            }
+        } catch (error) {
+            logger.error('Error monitoring trades:', error);
+        }
+    }
+
+    async updateTradeStatus(trade) {
+        if (!this.binanceAPI) return;
+
+        try {
+            // Get current price
+            const ticker = await this.binanceAPI.prices(trade.symbol);
+            const currentPrice = parseFloat(ticker[trade.symbol]);
+            
+            // Calculate P&L
+            const pnlPercent = trade.side === 'BUY' 
+                ? ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100
+                : ((trade.entryPrice - currentPrice) / trade.entryPrice) * 100;
+
+            trade.currentPrice = currentPrice;
+            trade.pnl = pnlPercent;
+            trade.pnlUSDT = (trade.quantity * trade.entryPrice * pnlPercent) / 100;
+            trade.lastUpdate = Date.now();
+
+        } catch (error) {
+            logger.error(`Failed to update trade ${trade.id}:`, error);
+        }
+    }
+
+    async checkTradeConditions(trade) {
+        if (!trade.currentPrice) return;
+
+        try {
+            // Check stop loss
+            if (trade.stopLoss && this.shouldTriggerStopLoss(trade)) {
+                await this.closeTrade(trade.id, 'stop_loss');
+                return;
+            }
+
+            // Check take profit
+            if (trade.takeProfit && this.shouldTriggerTakeProfit(trade)) {
+                await this.closeTrade(trade.id, 'take_profit');
+                return;
+            }
+
+            // Check trailing stop
+            if (trade.trailingStop) {
+                await this.updateTrailingStop(trade);
+            }
+
+        } catch (error) {
+            logger.error(`Error checking trade conditions for ${trade.id}:`, error);
+        }
+    }
+
+    shouldTriggerStopLoss(trade) {
+        if (trade.side === 'BUY') {
+            return trade.currentPrice <= trade.stopLoss;
+        } else {
+            return trade.currentPrice >= trade.stopLoss;
+        }
+    }
+
+    shouldTriggerTakeProfit(trade) {
+        if (trade.side === 'BUY') {
+            return trade.currentPrice >= trade.takeProfit;
+        } else {
+            return trade.currentPrice <= trade.takeProfit;
+        }
+    }
+
+    async updateTrailingStop(trade) {
+        const trailingPercent = trade.trailingStop;
+        const currentPrice = trade.currentPrice;
+        
+        if (trade.side === 'BUY') {
+            const newStopLoss = currentPrice * (1 - trailingPercent / 100);
+            if (newStopLoss > trade.stopLoss) {
+                trade.stopLoss = newStopLoss;
+                logger.trade(`Updated trailing stop for trade ${trade.id}`, {
+                    symbol: trade.symbol,
+                    newStopLoss: newStopLoss
+                });
+            }
+        } else {
+            const newStopLoss = currentPrice * (1 + trailingPercent / 100);
+            if (newStopLoss < trade.stopLoss) {
+                trade.stopLoss = newStopLoss;
+                logger.trade(`Updated trailing stop for trade ${trade.id}`, {
+                    symbol: trade.symbol,
+                    newStopLoss: newStopLoss
+                });
+            }
+        }
+    }
+
+    async performPeriodicAnalysis() {
+        try {
+            // Request comprehensive analysis for all symbols
+            const symbols = this.config.TRADING_PAIRS || ['BTCUSDT', 'ETHUSDT'];
+            
+            for (const symbol of symbols) {
+                try {
+                    await this.marketAnalyzer.requestComprehensiveAnalysis(symbol);
+                } catch (error) {
+                    logger.error(`Failed to analyze ${symbol}:`, error);
+                }
+            }
+        } catch (error) {
+            logger.error('Error in periodic analysis:', error);
+        }
+    }
+
+    async handleMarketAnalysis(data) {
+        if (!this.isRunning) return;
+
+        try {
+            // Basic market analysis handling
+            const { symbol, marketData, indicators } = data;
+            
+            // Log market update
+            logger.trade('Market analysis received', {
+                symbol,
+                price: marketData.price,
+                change: marketData.priceChangePercent
+            });
+
+        } catch (error) {
+            logger.error('Error handling market analysis:', error);
+        }
+    }
+
+    async handleComprehensiveAnalysis(analysisData) {
+        if (!this.isRunning) return;
+
+        try {
+            const { symbol, marketData, indicators, sentiment, aiAnalysis } = analysisData;
+
+            // Check if we already have a position in this symbol
+            if (this.hasActivePosition(symbol)) {
+                return;
+            }
+
+            // Check if we've reached max concurrent trades
+            if (this.activeTrades.size >= (this.config.MAX_CONCURRENT_TRADES || 5)) {
+                return;
+            }
+
+            // Generate trading signals
+            const signals = await this.generateTradingSignals(analysisData);
+
+            // Execute trades based on signals
+            for (const signal of signals) {
+                if (await this.shouldExecuteSignal(signal)) {
+                    await this.executeTrade(signal);
+                }
+            }
+        } catch (error) {
+            logger.error('Error handling comprehensive analysis:', error);
+        }
+    }
+
+    async generateTradingSignals(analysisData) {
+        const { symbol, marketData, indicators, sentiment, aiAnalysis } = analysisData;
+        const signals = [];
+
+        try {
+            // AI-based signals
+            if (aiAnalysis && this.enabledStrategies.has('ai_signals') && this.aiAnalyzer) {
+                try {
+                    const aiSignals = await this.aiAnalyzer.generateTradingSignals(
+                        aiAnalysis.predictions, 
+                        marketData, 
+                        this.tradingMode
+                    );
+                    signals.push(...aiSignals.map(s => ({ ...s, strategy: 'ai_signals' })));
+                } catch (error) {
+                    logger.error('Error generating AI signals:', error);
+                }
+            }
+
+            // Technical analysis signals
+            if (this.enabledStrategies.has('technical_analysis')) {
+                const techSignals = this.generateTechnicalSignals(symbol, marketData, indicators);
+                signals.push(...techSignals);
+            }
+
+            // Momentum signals
+            if (this.enabledStrategies.has('momentum')) {
+                const momentumSignals = this.generateMomentumSignals(symbol, marketData, indicators);
+                signals.push(...momentumSignals);
+            }
+
+            // Sentiment-based signals
+            if (this.enabledStrategies.has('sentiment_analysis')) {
+                const sentimentSignals = this.generateSentimentSignals(symbol, marketData, sentiment);
+                signals.push(...sentimentSignals);
+            }
+
+        } catch (error) {
+            logger.error('Error generating trading signals:', error);
+        }
+
+        return signals;
+    }
+
+    generateTechnicalSignals(symbol, marketData, indicators) {
+        const signals = [];
+        const price = marketData.price;
+
+        try {
+            // RSI signals
+            if (indicators.RSI) {
+                if (indicators.RSI < 30) {
+                    signals.push({
+                        symbol,
+                        action: 'BUY',
+                        strategy: 'technical_analysis',
+                        indicator: 'RSI',
+                        confidence: (30 - indicators.RSI) / 30,
+                        entryPrice: price,
+                        reasoning: `RSI oversold at ${indicators.RSI.toFixed(2)}`
+                    });
+                } else if (indicators.RSI > 70) {
+                    signals.push({
+                        symbol,
+                        action: 'SELL',
+                        strategy: 'technical_analysis',
+                        indicator: 'RSI',
+                        confidence: (indicators.RSI - 70) / 30,
+                        entryPrice: price,
+                        reasoning: `RSI overbought at ${indicators.RSI.toFixed(2)}`
+                    });
+                }
+            }
+
+            // MACD signals
+            if (indicators.MACD && indicators.MACDSignal) {
+                const macdDiff = indicators.MACD - indicators.MACDSignal;
+                if (macdDiff > 0 && indicators.MACDHistogram > 0) {
+                    signals.push({
+                        symbol,
+                        action: 'BUY',
+                        strategy: 'technical_analysis',
+                        indicator: 'MACD',
+                        confidence: Math.min(Math.abs(macdDiff) / 10, 0.8),
+                        entryPrice: price,
+                        reasoning: 'MACD bullish crossover'
+                    });
+                } else if (macdDiff < 0 && indicators.MACDHistogram < 0) {
+                    signals.push({
+                        symbol,
+                        action: 'SELL',
+                        strategy: 'technical_analysis',
+                        indicator: 'MACD',
+                        confidence: Math.min(Math.abs(macdDiff) / 10, 0.8),
+                        entryPrice: price,
+                        reasoning: 'MACD bearish crossover'
+                    });
+                }
+            }
+
+            // Bollinger Bands signals
+            if (indicators.BB_Upper && indicators.BB_Lower) {
+                if (price <= indicators.BB_Lower) {
+                    signals.push({
+                        symbol,
+                        action: 'BUY',
+                        strategy: 'technical_analysis',
+                        indicator: 'BB',
+                        confidence: 0.6,
+                        entryPrice: price,
+                        reasoning: 'Price at lower Bollinger Band'
+                    });
+                } else if (price >= indicators.BB_Upper) {
+                    signals.push({
+                        symbol,
+                        action: 'SELL',
+                        strategy: 'technical_analysis',
+                        indicator: 'BB',
+                        confidence: 0.6,
+                        entryPrice: price,
+                        reasoning: 'Price at upper Bollinger Band'
+                    });
+                }
+            }
+
+        } catch (error) {
+            logger.error('Error generating technical signals:', error);
+        }
+
+        return signals;
+    }
+
+    generateMomentumSignals(symbol, marketData, indicators) {
+        const signals = [];
+
+        try {
+            // Price momentum
+            const priceChange = marketData.priceChangePercent;
+            if (Math.abs(priceChange) > 5) {
+                signals.push({
+                    symbol,
+                    action: priceChange > 0 ? 'BUY' : 'SELL',
+                    strategy: 'momentum',
+                    indicator: 'price_momentum',
+                    confidence: Math.min(Math.abs(priceChange) / 10, 0.8),
+                    entryPrice: marketData.price,
+                    reasoning: `Strong momentum: ${priceChange.toFixed(2)}%`
+                });
+            }
+
+            // Volume momentum
+            if (indicators.VolumeRatio && indicators.VolumeRatio > 2) {
+                signals.push({
+                    symbol,
+                    action: priceChange > 0 ? 'BUY' : 'SELL',
+                    strategy: 'momentum',
+                    indicator: 'volume_momentum',
+                    confidence: Math.min(indicators.VolumeRatio / 5, 0.7),
+                    entryPrice: marketData.price,
+                    reasoning: `High volume: ${indicators.VolumeRatio.toFixed(2)}x average`
+                });
+            }
+
+        } catch (error) {
+            logger.error('Error generating momentum signals:', error);
+        }
+
+        return signals;
+    }
+
+    generateSentimentSignals(symbol, marketData, sentiment) {
+        const signals = [];
+
+        try {
+            if (sentiment && sentiment.overall) {
+                const sentimentScore = sentiment.overall;
+                
+                if (sentimentScore > 0.7) {
+                    signals.push({
+                        symbol,
+                        action: 'BUY',
+                        strategy: 'sentiment_analysis',
+                        indicator: 'sentiment',
+                        confidence: sentimentScore,
+                        entryPrice: marketData.price,
+                        reasoning: `Bullish sentiment: ${(sentimentScore * 100).toFixed(1)}%`
+                    });
+                } else if (sentimentScore < 0.3) {
+                    signals.push({
+                        symbol,
+                        action: 'SELL',
+                        strategy: 'sentiment_analysis',
+                        indicator: 'sentiment',
+                        confidence: 1 - sentimentScore,
+                        entryPrice: marketData.price,
+                        reasoning: `Bearish sentiment: ${(sentimentScore * 100).toFixed(1)}%`
+                    });
+                }
+            }
+
+        } catch (error) {
+            logger.error('Error generating sentiment signals:', error);
+        }
+
+        return signals;
+    }
+
+    async shouldExecuteSignal(signal) {
+        try {
+            // Check minimum confidence
+            if (signal.confidence < (this.config.MIN_SIGNAL_CONFIDENCE || 0.6)) {
+                return false;
+            }
+
+            // Check for conflicting signals
+            if (this.hasConflictingSignal(signal)) {
+                return false;
+            }
+
+            // Risk management checks
+            if (this.riskManager) {
+                return await this.riskManager.shouldExecuteTrade(signal, this.activeTrades);
+            }
+
+            return true;
+
+        } catch (error) {
+            logger.error('Error evaluating signal:', error);
+            return false;
+        }
+    }
+
+    async executeTrade(signal) {
+        if (!this.binanceAPI) {
+            logger.trade('Cannot execute trade: No API connection');
+            return null;
+        }
+
+        try {
+            const tradeId = uuidv4();
+            const quantity = this.calculateTradeQuantity(signal);
+            
+            // Create trade object
+            const trade = {
+                id: tradeId,
+                symbol: signal.symbol,
+                side: signal.action,
+                quantity: quantity,
+                entryPrice: signal.entryPrice,
+                strategy: signal.strategy,
+                confidence: signal.confidence,
+                reasoning: signal.reasoning,
+                status: 'PENDING',
+                openTime: Date.now(),
+                stopLoss: this.calculateStopLoss(signal),
+                takeProfit: this.calculateTakeProfit(signal)
+            };
+
+            // Execute order on exchange
+            const order = await this.binanceAPI.order({
+                symbol: signal.symbol,
+                side: signal.action,
+                type: 'MARKET',
+                quantity: quantity
+            });
+
+            if (order) {
+                trade.orderId = order.orderId;
+                trade.status = 'FILLED';
+                trade.executedPrice = order.fills?.[0]?.price || signal.entryPrice;
+                
+                this.activeTrades.set(tradeId, trade);
+                this.statistics.totalTrades++;
+                
+                logger.trade('Trade executed', trade);
+                this.emit('tradeOpened', trade);
+                
+                return trade;
+            }
+
+        } catch (error) {
+            logger.error('Failed to execute trade:', error);
+            return null;
+        }
+    }
+
+    calculateTradeQuantity(signal) {
+        const baseAmount = this.config.DEFAULT_TRADE_AMOUNT || 10;
+        const confidenceMultiplier = signal.confidence;
+        
+        // Adjust quantity based on trading mode
+        const modeMultiplier = {
+            conservative: 0.5,
+            balanced: 1.0,
+            aggressive: 1.5,
+            scalping: 2.0
+        }[this.tradingMode] || 1.0;
+        
+        return (baseAmount * confidenceMultiplier * modeMultiplier).toFixed(8);
+    }
+
+    calculateStopLoss(signal) {
+        const stopLossPercent = this.config.STOP_LOSS_PERCENTAGE || 2;
+        
+        if (signal.action === 'BUY') {
+            return signal.entryPrice * (1 - stopLossPercent / 100);
+        } else {
+            return signal.entryPrice * (1 + stopLossPercent / 100);
+        }
+    }
+
+    calculateTakeProfit(signal) {
+        const takeProfitPercent = this.config.TAKE_PROFIT_PERCENTAGE || 4;
+        
+        if (signal.action === 'BUY') {
+            return signal.entryPrice * (1 + takeProfitPercent / 100);
+        } else {
+            return signal.entryPrice * (1 - takeProfitPercent / 100);
+        }
+    }
+
+    async closeTrade(tradeId, reason = 'manual') {
+        const trade = this.activeTrades.get(tradeId);
+        if (!trade) {
+            logger.error(`Trade ${tradeId} not found`);
+            return false;
+        }
+
+        try {
+            // Execute close order
+            if (this.binanceAPI) {
+                const closeOrder = await this.binanceAPI.order({
+                    symbol: trade.symbol,
+                    side: trade.side === 'BUY' ? 'SELL' : 'BUY',
+                    type: 'MARKET',
+                    quantity: trade.quantity
+                });
+
+                if (closeOrder) {
+                    trade.exitPrice = closeOrder.fills?.[0]?.price || trade.currentPrice;
+                    trade.closeOrderId = closeOrder.orderId;
+                }
+            }
+
+            // Update trade status
+            trade.status = 'CLOSED';
+            trade.closeTime = Date.now();
+            trade.closeReason = reason;
+            trade.duration = trade.closeTime - trade.openTime;
+
+            // Calculate final P&L
+            if (trade.exitPrice) {
+                const pnlPercent = trade.side === 'BUY' 
+                    ? ((trade.exitPrice - trade.entryPrice) / trade.entryPrice) * 100
+                    : ((trade.entryPrice - trade.exitPrice) / trade.entryPrice) * 100;
+
+                trade.pnl = pnlPercent;
+                trade.pnlUSDT = (trade.quantity * trade.entryPrice * pnlPercent) / 100;
+            }
+
+            // Update statistics
+            this.updateStatistics(trade);
+
+            // Move to history
+            this.tradeHistory.push({ ...trade });
+            this.activeTrades.delete(tradeId);
+
+            logger.trade('Trade closed', {
+                id: tradeId,
+                symbol: trade.symbol,
+                pnl: trade.pnl,
+                reason: reason
+            });
+
+            this.emit('tradeClosed', trade);
+            return true;
+
+        } catch (error) {
+            logger.error(`Failed to close trade ${tradeId}:`, error);
+            return false;
+        }
+    }
+
+    async closeAllTrades(reason = 'manual') {
+        const tradeIds = Array.from(this.activeTrades.keys());
+        const results = [];
+
+        for (const tradeId of tradeIds) {
+            const result = await this.closeTrade(tradeId, reason);
+            results.push(result);
+        }
+
+        return results;
+    }
+
+    updateStatistics(trade) {
+        if (trade.pnl > 0) {
+            this.statistics.winningTrades++;
+        } else if (trade.pnl < 0) {
+            this.statistics.losingTrades++;
+        }
+
+        this.statistics.totalPnL += trade.pnl || 0;
+        this.statistics.winRate = this.statistics.totalTrades > 0 
+            ? (this.statistics.winningTrades / this.statistics.totalTrades) * 100 
+            : 0;
+        this.statistics.averageReturn = this.statistics.totalTrades > 0 
+            ? this.statistics.totalPnL / this.statistics.totalTrades 
+            : 0;
+
+        // Update max drawdown
+        if (trade.pnl < 0) {
+            this.statistics.maxDrawdown = Math.min(this.statistics.maxDrawdown, trade.pnl);
+        }
+    }
+
+    handleExecutionReport(report) {
+        try {
+            const trade = Array.from(this.activeTrades.values())
+                .find(t => t.orderId === report.orderId);
+
+            if (trade) {
+                trade.status = report.orderStatus;
+                trade.executedQuantity = report.executedQty;
+                
+                logger.trade('Execution report received', {
+                    tradeId: trade.id,
+                    status: report.orderStatus
+                });
+            }
+        } catch (error) {
+            logger.error('Error handling execution report:', error);
+        }
+    }
+
+    handleBalanceUpdate(update) {
+        try {
+            logger.trade('Balance update received', update);
+        } catch (error) {
+            logger.error('Error handling balance update:', error);
+        }
+    }
+
+    handleMarketOpportunity(opportunity) {
+        if (!this.isRunning) return;
+
+        const signal = {
+            symbol: opportunity.symbol,
+            action: opportunity.type === 'bullish' ? 'BUY' : 'SELL',
+            strategy: 'market_opportunity',
+            confidence: opportunity.strength / 100,
+            entryPrice: this.marketAnalyzer.getMarketData(opportunity.symbol)?.price,
+            reasoning: opportunity.reasons.join(', ')
+        };
+
+        if (this.shouldExecuteSignal(signal)) {
+            this.executeTrade(signal);
+        }
+    }
+
+    // Utility methods
+    hasActivePosition(symbol) {
+        return Array.from(this.activeTrades.values()).some(trade => trade.symbol === symbol);
+    }
+
+    hasConflictingSignal(signal) {
+        // Check for opposite signals in the same symbol
+        return Array.from(this.activeTrades.values()).some(trade => 
+            trade.symbol === signal.symbol && 
+            trade.side !== signal.action &&
+            trade.status === 'ACTIVE'
+        );
+    }
+
+    getStatus() {
+        return {
+            isRunning: this.isRunning,
+            tradingMode: this.tradingMode,
+            enabledStrategies: Array.from(this.enabledStrategies),
+            activeTrades: this.activeTrades.size,
+            totalTrades: this.statistics.totalTrades,
+            winRate: this.statistics.winRate,
+            totalPnL: this.statistics.totalPnL,
+            maxDrawdown: this.statistics.maxDrawdown
+        };
+    }
+
+    getActiveTrades() {
+        return Array.from(this.activeTrades.values());
+    }
+
+    getTradeHistory(limit = 50) {
+        return this.tradeHistory
+            .sort((a, b) => b.closeTime - a.closeTime)
+            .slice(0, limit);
+    }
+
+    getStatistics() {
+        return { ...this.statistics };
+    }
+
+    setTradingMode(mode) {
+        const validModes = ['conservative', 'balanced', 'aggressive', 'scalping'];
+        if (validModes.includes(mode)) {
+            this.tradingMode = mode;
+            logger.trade('Trading mode changed', { mode });
+            return true;
+        }
+        return false;
+    }
+
+    enableStrategy(strategy) {
+        this.enabledStrategies.add(strategy);
+        logger.trade('Strategy enabled', { strategy });
+    }
+
+    disableStrategy(strategy) {
+        this.enabledStrategies.delete(strategy);
+        logger.trade('Strategy disabled', { strategy });
+    }
+
+    // Additional utility methods
+    async getAccountBalance() {
+        if (!this.binanceAPI) {
+            return null;
+        }
+
+        try {
+            const accountInfo = await this.binanceAPI.getAccountInfo();
+            return accountInfo;
+        } catch (error) {
+            logger.error('Failed to get account balance:', error);
+            return null;
+        }
+    }
+
+    async getMarketData(symbol) {
+        try {
+            return this.marketAnalyzer.getMarketData(symbol);
+        } catch (error) {
+            logger.error(`Failed to get market data for ${symbol}:`, error);
+            return null;
+        }
+    }
+
+    async getTechnicalIndicators(symbol) {
+        try {
+            return this.marketAnalyzer.getTechnicalIndicators(symbol);
+        } catch (error) {
+            logger.error(`Failed to get technical indicators for ${symbol}:`, error);
+            return null;
+        }
+    }
+
+    // Performance metrics
+    calculateSharpeRatio() {
+        if (this.tradeHistory.length < 10) {
+            return 0;
+        }
+
+        const returns = this.tradeHistory.map(trade => trade.pnl || 0);
+        const avgReturn = returns.reduce((sum, ret) => sum + ret, 0) / returns.length;
+        const variance = returns.reduce((sum, ret) => sum + Math.pow(ret - avgReturn, 2), 0) / returns.length;
+        const stdDev = Math.sqrt(variance);
+
+        return stdDev > 0 ? (avgReturn / stdDev) : 0;
+    }
+
+    calculateMaxDrawdown() {
+        if (this.tradeHistory.length === 0) {
+            return 0;
+        }
+
+        let maxDrawdown = 0;
+        let peak = 0;
+        let runningPnL = 0;
+
+        for (const trade of this.tradeHistory.sort((a, b) => a.closeTime - b.closeTime)) {
+            runningPnL += trade.pnl || 0;
+            if (runningPnL > peak) {
+                peak = runningPnL;
+            }
+            const drawdown = peak - runningPnL;
+            if (drawdown > maxDrawdown) {
+                maxDrawdown = drawdown;
+            }
+        }
+
+        return maxDrawdown;
+    }
+
+    // Risk management methods
+    async checkRiskLimits() {
+        try {
+            // Check daily loss limit
+            const todayTrades = this.getTodayTrades();
+            const todayPnL = todayTrades.reduce((sum, trade) => sum + (trade.pnl || 0), 0);
+            
+            const maxDailyLoss = this.config.MAX_DAILY_LOSS_PERCENT || 5;
+            if (todayPnL < -maxDailyLoss) {
+                logger.trade('Daily loss limit reached, stopping trading', { todayPnL, limit: maxDailyLoss });
+                await this.stop();
+                return false;
+            }
+
+            // Check maximum concurrent trades
+            if (this.activeTrades.size >= (this.config.MAX_CONCURRENT_TRADES || 5)) {
+                return false;
+            }
+
+            return true;
+        } catch (error) {
+            logger.error('Error checking risk limits:', error);
+            return false;
+        }
+    }
+
+    getTodayTrades() {
+        const today = new Date().toDateString();
+        return this.tradeHistory.filter(trade => {
+            const tradeDate = new Date(trade.closeTime).toDateString();
+            return tradeDate === today;
+        });
+    }
+
+    // Emergency methods
+    async emergencyStop() {
+        try {
+            logger.trade('Emergency stop initiated');
+            
+            // Close all active trades immediately
+            await this.closeAllTrades('emergency_stop');
+            
+            // Stop the bot
+            await this.stop();
+            
+            // Emit emergency event
+            this.emit('emergencyStop', {
+                timestamp: Date.now(),
+                activeTrades: this.activeTrades.size,
+                reason: 'Manual emergency stop'
+            });
+
+            return true;
+        } catch (error) {
+            logger.error('Error during emergency stop:', error);
+            return false;
+        }
+    }
+
+    // Market analysis integration
+    async requestMarketAnalysis(symbol) {
+        try {
+            if (this.marketAnalyzer) {
+                return await this.marketAnalyzer.requestComprehensiveAnalysis(symbol);
+            }
+            return null;
+        } catch (error) {
+            logger.error(`Failed to request analysis for ${symbol}:`, error);
+            return null;
+        }
+    }
+
+    async getAIAnalysis(symbol) {
+        try {
+            if (this.aiAnalyzer) {
+                const marketData = await this.getMarketData(symbol);
+                const indicators = await this.getTechnicalIndicators(symbol);
+                
+                if (marketData && indicators) {
+                    return await this.aiAnalyzer.analyzeMarket(marketData, indicators, []);
+                }
+            }
+            return null;
+        } catch (error) {
+            logger.error(`Failed to get AI analysis for ${symbol}:`, error);
+            return null;
+        }
+    }
+
+    // Configuration methods
+    updateConfiguration(newConfig) {
+        try {
+            // Update trading parameters
+            if (newConfig.tradingMode && this.setTradingMode(newConfig.tradingMode)) {
+                logger.trade('Trading mode updated', { mode: newConfig.tradingMode });
+            }
+
+            if (newConfig.enabledStrategies) {
+                this.enabledStrategies.clear();
+                newConfig.enabledStrategies.forEach(strategy => {
+                    this.enableStrategy(strategy);
+                });
+            }
+
+            // Update config reference
+            this.config = { ...this.config, ...newConfig };
+            
+            logger.trade('Configuration updated', newConfig);
+            return true;
+        } catch (error) {
+            logger.error('Failed to update configuration:', error);
+            return false;
+        }
+    }
+
+    // Export/Import methods
+    exportTradingData() {
+        return {
+            statistics: this.statistics,
+            tradeHistory: this.tradeHistory,
+            activeTrades: Array.from(this.activeTrades.values()),
+            configuration: {
+                tradingMode: this.tradingMode,
+                enabledStrategies: Array.from(this.enabledStrategies)
+            },
+            exportTime: Date.now()
+        };
+    }
+
+    importTradingData(data) {
+        try {
+            if (data.statistics) {
+                this.statistics = { ...this.statistics, ...data.statistics };
+            }
+
+            if (data.tradeHistory) {
+                this.tradeHistory = [...this.tradeHistory, ...data.tradeHistory];
+            }
+
+            if (data.configuration) {
+                this.updateConfiguration(data.configuration);
+            }
+
+            logger.trade('Trading data imported successfully');
+            return true;
+        } catch (error) {
+            logger.error('Failed to import trading data:', error);
+            return false;
+        }
+    }
+
+    // Cleanup and disposal
+    cleanup() {
+        try {
+            // Stop all cron jobs
+            this.stopCronJobs();
+            
+            // Close any remaining trades
+            this.closeAllTrades('bot_shutdown');
+            
+            // Remove all event listeners
+            this.removeAllListeners();
+            
+            // Clear data structures
+            this.activeTrades.clear();
+            this.cronJobs.clear();
+            
+            logger.trade('TradingBot cleanup completed');
+        } catch (error) {
+            logger.error('Error during cleanup:', error);
+        }
+    }
+
+    // Health check
+    isHealthy() {
+        return {
+            isRunning: this.isRunning,
+            hasActiveConnections: !!this.binanceAPI,
+            activeTrades: this.activeTrades.size,
+            cronJobsActive: this.cronJobs.size,
+            lastActivity: Date.now(),
+            memoryUsage: process.memoryUsage(),
+            uptime: process.uptime()
+        };
+    }
+
+    // Event handlers for external integrations
+    onTradeOpened(callback) {
+        this.on('tradeOpened', callback);
+    }
+
+    onTradeClosed(callback) {
+        this.on('tradeClosed', callback);
+    }
+
+    onEmergencyStop(callback) {
+        this.on('emergencyStop', callback);
+    }
+
+    onError(callback) {
+        this.on('error', callback);
+    }
+
+    // Debug and monitoring methods
+    getDebugInfo() {
+        return {
+            status: this.getStatus(),
+            activeTrades: this.getActiveTrades(),
+            recentHistory: this.getTradeHistory(10),
+            statistics: this.getStatistics(),
+            configuration: {
+                tradingMode: this.tradingMode,
+                enabledStrategies: Array.from(this.enabledStrategies),
+                config: this.config
+            },
+            runtime: {
+                uptime: process.uptime(),
+                memory: process.memoryUsage(),
+                cronJobs: Array.from(this.cronJobs.keys())
+            }
+        };
+    }
+
+    // Performance monitoring
+    startPerformanceMonitoring() {
+        const performanceJob = new cron.CronJob('0 0 * * * *', () => {
+            this.logPerformanceMetrics();
+        }, null, true, 'UTC');
+        
+        this.cronJobs.set('performanceMonitoring', performanceJob);
+        logger.trade('Performance monitoring started');
+    }
+
+    logPerformanceMetrics() {
+        try {
+            const metrics = {
+                timestamp: Date.now(),
+                statistics: this.statistics,
+                activeTrades: this.activeTrades.size,
+                sharpeRatio: this.calculateSharpeRatio(),
+                maxDrawdown: this.calculateMaxDrawdown(),
+                todayPnL: this.getTodayTrades().reduce((sum, trade) => sum + (trade.pnl || 0), 0),
+                memoryUsage: process.memoryUsage()
+            };
+
+            logger.trade('Performance metrics', metrics);
+            this.emit('performanceUpdate', metrics);
+        } catch (error) {
+            logger.error('Error logging performance metrics:', error);
+        }
+    }
+}
+
+module.exports = TradingBot;

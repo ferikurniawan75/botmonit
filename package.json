@@ -1,0 +1,68 @@
+{
+  "name": "crypto-trading-bot",
+  "version": "1.0.0",
+  "description": "Advanced Cryptocurrency Trading Bot with AI Analysis",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "install-bot": "node install.js",
+    "setup": "chmod +x setup.sh && ./setup.sh",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:config": "node -e \"require('./src/config/config'); console.log('✅ Configuration valid')\"",
+    "logs": "tail -f logs/combined.log",
+    "logs:error": "tail -f logs/error.log",
+    "logs:trading": "tail -f logs/trading.log",
+    "pm2:start": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop crypto-trading-bot",
+    "pm2:restart": "pm2 restart crypto-trading-bot",
+    "pm2:logs": "pm2 logs crypto-trading-bot",
+    "pm2:monitor": "pm2 monit",
+    "docker:build": "docker build -t crypto-trading-bot .",
+    "docker:run": "docker run -d --name trading-bot --env-file .env -p 3000:3000 crypto-trading-bot",
+    "docker:stop": "docker stop trading-bot && docker rm trading-bot",
+    "docker:logs": "docker logs -f trading-bot",
+    "docker:compose": "docker-compose up -d",
+    "docker:compose:stop": "docker-compose down",
+    "backup:config": "cp .env .env.backup.$(date +%Y%m%d_%H%M%S)",
+    "backup:logs": "tar -czf logs_backup_$(date +%Y%m%d_%H%M%S).tar.gz logs/",
+    "clean": "rm -rf node_modules package-lock.json && npm install",
+    "clean:logs": "rm -rf logs/*.log",
+    "health": "curl -f http://localhost:3000/health || exit 1",
+    "validate": "npm run test:config && npm run health"
+  },
+  "keywords": [
+    "cryptocurrency",
+    "trading",
+    "bot",
+    "binance",
+    "ai",
+    "analysis"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "@tensorflow/tfjs": "^4.22.0",
+    "axios": "^1.6.0",
+    "cors": "^2.8.5",
+    "cron": "^3.1.6",
+    "dotenv": "^16.6.1",
+    "express": "^4.18.2",
+    "helmet": "^7.1.0",
+    "lodash": "^4.17.21",
+    "moment": "^2.29.4",
+    "node-binance-api": "^0.13.1",
+    "node-telegram-bot-api": "^0.64.0",
+    "simple-statistics": "^7.8.3",
+    "technicalindicators": "^3.1.0",
+    "uuid": "^9.0.1",
+    "winston": "^3.11.0",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
