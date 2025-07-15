@@ -19,12 +19,29 @@ const logFormat = winston.format.combine(
     winston.format.prettyPrint()
 );
 
-// Console format for development
+// Console format for development with spam filter
 const consoleFormat = winston.format.combine(
     winston.format.colorize(),
     winston.format.timestamp({
         format: 'HH:mm:ss'
     }),
+    // Add filter to prevent spam messages
+    winston.format((info) => {
+        // Filter out Binance API spam messages
+        if (info.message && typeof info.message === 'string') {
+            // Block repeated [BINANCE] API messages without useful content
+            if (info.message.includes('[BINANCE] API') && 
+                !info.message.includes('successful') && 
+                !info.message.includes('error') &&
+                !info.message.includes('failed') &&
+                !info.message.includes('retrieved') &&
+                !info.message.includes('started') &&
+                !info.message.includes('stopped')) {
+                return false; // Filter out this message
+            }
+        }
+        return info;
+    })(),
     winston.format.printf(({ timestamp, level, message, ...meta }) => {
         let msg = `${timestamp} [${level}]: ${message}`;
         if (Object.keys(meta).length > 0) {
@@ -70,7 +87,7 @@ const logger = winston.createLogger({
     ]
 });
 
-// Add console transport for development
+// Add console transport for development (with spam filtering)
 if (config.NODE_ENV !== 'production') {
     logger.add(new winston.transports.Console({
         format: consoleFormat
@@ -95,6 +112,10 @@ logger.telegram = (action, data) => {
 };
 
 logger.binance = (action, data) => {
+    // Add additional filtering for binance logs to prevent spam
+    if (action === 'API' && (!data || Object.keys(data).length === 0)) {
+        return; // Don't log empty API messages
+    }
     logger.info(`[BINANCE] ${action}`, data);
 };
 

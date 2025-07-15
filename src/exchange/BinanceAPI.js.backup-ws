@@ -1,0 +1,182 @@
+const Binance = require('node-binance-api');
+const WebSocket = require('ws');
+const EventEmitter = require('events');
+const logger = require('../utils/logger');
+
+class BinanceAPI extends EventEmitter {
+    constructor(config) {
+        super();
+        this.config = config;
+        this.isTestnet = config.useTestnet;
+        this.wsConnections = new Map();
+        this.tickerCache = new Map();
+        this.accountInfo = null;
+        this.lastPriceUpdate = new Map();
+        
+        // Initialize Binance API with fixed configuration
+        this.binance = new Binance().options({
+            APIKEY: config.apiKey,
+            APISECRET: config.secretKey,
+            useServerTime: true,
+            test: this.isTestnet,
+            verbose: false,
+            recvWindow: 5000,  // FIXED: Added receive window
+            log: (msg) => logger.binance('API', msg)
+        });
+
+        // Set up event handlers
+        this.setupEventHandlers();
+    }
+
+    setupEventHandlers() {
+        this.on('error', (error) => {
+            logger.error('BinanceAPI error:', error);
+        });
+
+        this.on('tickerUpdate', (ticker) => {
+            this.tickerCache.set(ticker.symbol, ticker);
+            this.lastPriceUpdate.set(ticker.symbol, Date.now());
+        });
+    }
+
+    async testConnection() {
+        try {
+            const serverTime = await this.binance.time();
+            logger.binance('Connection test successful', { 
+                serverTime, 
+                testnet: this.isTestnet 
+            });
+            return true;
+        } catch (error) {
+            logger.error('Binance connection test failed:', error);
+            throw error;
+        }
+    }
+
+    async getAccountInfo() {
+        try {
+            this.accountInfo = await this.binance.account();
+            logger.binance('Account info retrieved', {
+                balances: this.accountInfo.balances.filter(b => parseFloat(b.free) > 0).length
+            });
+            return this.accountInfo;
+        } catch (error) {
+            logger.error('Failed to get account info:', error);
+            throw error;
+        }
+    }
+
+    async getBalance(asset = 'USDT') {
+        try {
+            if (!this.accountInfo) {
+                await this.getAccountInfo();
+            }
+            
+            const balance = this.accountInfo.balances.find(b => b.asset === asset);
+            return balance ? {
+                asset: balance.asset,
+                free: parseFloat(balance.free),
+                locked: parseFloat(balance.locked),
+                total: parseFloat(balance.free) + parseFloat(balance.locked)
+            } : null;
+        } catch (error) {
+            logger.error(`Failed to get ${asset} balance:`, error);
+            throw error;
+        }
+    }
+
+    async getExchangeInfo() {
+        try {
+            const exchangeInfo = await this.binance.exchangeInfo();
+            logger.binance('Exchange info retrieved', {
+                symbols: exchangeInfo.symbols.length,
+                timezone: exchangeInfo.timezone,
+                serverTime: exchangeInfo.serverTime
+            });
+            return exchangeInfo;
+        } catch (error) {
+            logger.error('Failed to get exchange info:', error);
+            throw error;
+        }
+    }
+
+    async getTicker(symbol) {
+        try {
+            const ticker = await this.binance.prices(symbol);
+            logger.binance('Ticker retrieved', { symbol, price: ticker[symbol] });
+            return ticker;
+        } catch (error) {
+            logger.error('Failed to get ticker:', error);
+            throw error;
+        }
+    }
+
+    startTickerStream(symbols, callback) {
+        try {
+            const symbolsArray = Array.isArray(symbols) ? symbols : [symbols];
+            
+            symbolsArray.forEach(symbol => {
+                if (!this.wsConnections.has(symbol)) {
+                    const ws = this.binance.websockets.miniTicker([symbol], (ticker) => {
+                        this.emit('tickerUpdate', ticker);
+                        if (callback) callback(ticker);
+                    });
+                    
+                    this.wsConnections.set(symbol, ws);
+                    logger.binance(`Ticker stream started for ${symbol}`);
+                }
+            });
+        } catch (error) {
+            logger.error('Failed to start ticker stream:', error);
+            throw error;
+        }
+    }
+
+    startKlineStream(symbols, interval = '5m', callback) {
+        try {
+            const symbolsArray = Array.isArray(symbols) ? symbols : [symbols];
+            
+            symbolsArray.forEach(symbol => {
+                const streamKey = `${symbol}_${interval}_kline`;
+                if (!this.wsConnections.has(streamKey)) {
+                    const ws = this.binance.websockets.candlesticks([symbol], interval, (candlesticks) => {
+                        this.emit('klineUpdate', { symbol, interval, data: candlesticks });
+                        if (callback) callback({ symbol, interval, data: candlesticks });
+                    });
+                    
+                    this.wsConnections.set(streamKey, ws);
+                    logger.binance(`Kline stream started for ${symbol} ${interval}`);
+                }
+            });
+        } catch (error) {
+            logger.error('Failed to start kline stream:', error);
+            throw error;
+        }
+    }
+
+    startUserDataStream() {
+        try {
+            this.binance.websockets.userData(
+                (data) => { this.emit('executionReport', data); },
+                (data) => { this.emit('outboundAccountPosition', data); },
+                (data) => { this.emit('balanceUpdate', data); }
+            );
+            logger.binance('User data stream started');
+        } catch (error) {
+            logger.error('Failed to start user data stream:', error);
+            throw error;
+        }
+    }
+
+    stopAllStreams() {
+        try {
+            this.binance.websockets.terminations();
+            this.wsConnections.clear();
+            logger.binance('All WebSocket streams terminated');
+        } catch (error) {
+            logger.error('Error stopping streams:', error);
+        }
+    }
+}
+
+module.exports = BinanceAPI;

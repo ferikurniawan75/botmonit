@@ -191,147 +191,47 @@ class BinanceAPI extends EventEmitter {
 
     startTickerStream(symbols, callback) {
         try {
-            if (!symbols) {
-                logger.warn('No symbols provided for ticker stream');
-                return;
-            }
-            
             const symbolsArray = Array.isArray(symbols) ? symbols : [symbols];
-            const streamName = `ticker_${symbolsArray.join('_')}`;
             
-            if (this.wsConnections.has(streamName)) {
-                logger.binance('Ticker stream already exists', { symbols: symbolsArray });
-                return;
-            }
-
-            // Use a safe wrapper function for the callback
-            const safeCallback = (ticker) => {
-                try {
-                    const formattedTicker = {
-                        symbol: ticker.symbol,
-                        price: parseFloat(ticker.close || ticker.price || 0),
-                        priceChange: parseFloat(ticker.change || ticker.priceChange || 0),
-                        priceChangePercent: parseFloat(ticker.percentage || ticker.priceChangePercent || 0),
-                        volume: parseFloat(ticker.volume || 0),
-                        quoteVolume: parseFloat(ticker.quoteVolume || 0),
-                        openPrice: parseFloat(ticker.open || ticker.openPrice || 0),
-                        highPrice: parseFloat(ticker.high || ticker.highPrice || 0),
-                        lowPrice: parseFloat(ticker.low || ticker.lowPrice || 0),
-                        timestamp: Date.now()
-                    };
-
-                    this.emit('tickerUpdate', formattedTicker);
-                    
-                    // Only call callback if it's a function
-                    if (callback && typeof callback === 'function') {
-                        callback(formattedTicker);
-                    }
-                } catch (error) {
-                    logger.error('Error in ticker callback:', error.message);
-                }
-            };
-
-            try {
-                const ws = this.binance.websockets.miniTicker(symbolsArray, safeCallback);
-                this.wsConnections.set(streamName, ws);
-                logger.binance('Ticker stream started', { symbols: symbolsArray });
-                return ws;
-            } catch (error) {
-                logger.error('Failed to start ticker stream:', error.message);
-                // Fallback: emit mock data
-                setTimeout(() => {
-                    symbolsArray.forEach(symbol => {
-                        this.emit('tickerUpdate', {
-                            symbol: symbol,
-                            price: 50000 + Math.random() * 10000,
-                            priceChange: (Math.random() - 0.5) * 1000,
-                            priceChangePercent: (Math.random() - 0.5) * 10,
-                            volume: Math.random() * 1000,
-                            quoteVolume: Math.random() * 50000000,
-                            openPrice: 50000 + Math.random() * 10000,
-                            highPrice: 50000 + Math.random() * 10000,
-                            lowPrice: 50000 + Math.random() * 10000,
-                            timestamp: Date.now()
-                        });
+            symbolsArray.forEach(symbol => {
+                if (!this.wsConnections.has(symbol)) {
+                    const ws = this.binance.websockets.miniTicker([symbol], (ticker) => {
+                        this.emit('tickerUpdate', ticker);
+                        if (callback) callback(ticker);
                     });
-                }, 1000);
-            }
-            
+                    
+                    this.wsConnections.set(symbol, ws);
+                    logger.binance(`Ticker stream started for ${symbol}`);
+                }
+            });
         } catch (error) {
-            logger.error('Failed to start ticker stream:', error.message);
+            logger.error('Failed to start ticker stream:', error);
+            throw error;
         }
     }
-    startKlineStream(symbol, interval, callback) {
+
+    startKlineStream(symbols, interval = '5m', callback) {
         try {
-            if (!symbol || !interval) {
-                logger.warn('Symbol or interval not provided for kline stream');
-                return;
-            }
+            const symbolsArray = Array.isArray(symbols) ? symbols : [symbols];
             
-            const streamName = `kline_${symbol}_${interval}`;
-            
-            if (this.wsConnections.has(streamName)) {
-                logger.binance('Kline stream already exists', { symbol, interval });
-                return;
-            }
-
-            // Use a safe wrapper function for the callback
-            const safeCallback = (candlestick) => {
-                try {
-                    const formattedKline = {
-                        symbol: candlestick.s || symbol,
-                        openTime: candlestick.t || Date.now() - 300000,
-                        closeTime: candlestick.T || Date.now(),
-                        open: parseFloat(candlestick.o || 0),
-                        high: parseFloat(candlestick.h || 0),
-                        low: parseFloat(candlestick.l || 0),
-                        close: parseFloat(candlestick.c || 0),
-                        volume: parseFloat(candlestick.v || 0),
-                        quoteVolume: parseFloat(candlestick.q || 0),
-                        trades: candlestick.n || 0,
-                        isFinal: candlestick.x || false
-                    };
-
-                    this.emit('klineUpdate', formattedKline);
-                    
-                    // Only call callback if it's a function
-                    if (callback && typeof callback === 'function') {
-                        callback(formattedKline);
-                    }
-                } catch (error) {
-                    logger.error('Error in kline callback:', error.message);
-                }
-            };
-
-            try {
-                const ws = this.binance.websockets.candlesticks(symbol, interval, safeCallback);
-                this.wsConnections.set(streamName, ws);
-                logger.binance('Kline stream started', { symbol, interval });
-                return ws;
-            } catch (error) {
-                logger.error('Failed to start kline stream:', error.message);
-                // Fallback: emit mock data
-                setTimeout(() => {
-                    this.emit('klineUpdate', {
-                        symbol: symbol,
-                        openTime: Date.now() - 300000,
-                        closeTime: Date.now(),
-                        open: 50000 + Math.random() * 10000,
-                        high: 50000 + Math.random() * 10000,
-                        low: 50000 + Math.random() * 10000,
-                        close: 50000 + Math.random() * 10000,
-                        volume: Math.random() * 1000,
-                        quoteVolume: Math.random() * 50000000,
-                        trades: Math.floor(Math.random() * 1000),
-                        isFinal: true
+            symbolsArray.forEach(symbol => {
+                const streamKey = `${symbol}_${interval}_kline`;
+                if (!this.wsConnections.has(streamKey)) {
+                    const ws = this.binance.websockets.candlesticks([symbol], interval, (candlesticks) => {
+                        this.emit('klineUpdate', { symbol, interval, data: candlesticks });
+                        if (callback) callback({ symbol, interval, data: candlesticks });
                     });
-                }, 2000);
-            }
-            
+                    
+                    this.wsConnections.set(streamKey, ws);
+                    logger.binance(`Kline stream started for ${symbol} ${interval}`);
+                }
+            });
         } catch (error) {
-            logger.error('Failed to start kline stream:', error.message);
+            logger.error('Failed to start kline stream:', error);
+            throw error;
         }
     }
+
     startUserDataStream() {
         try {
             this.binance.websockets.userData(
@@ -350,13 +250,12 @@ class BinanceAPI extends EventEmitter {
         try {
             for (const [streamName, ws] of this.wsConnections) {
                 try {
-                    // Try multiple methods to close WebSocket
+                    // Use correct method to terminate websocket
                     if (this.binance.websockets && this.binance.websockets.terminate) {
                         this.binance.websockets.terminate(ws);
-                    } else if (ws && typeof ws.close === 'function') {
+                    } else if (ws && ws.close) {
+                        // Fallback to direct WebSocket close
                         ws.close();
-                    } else if (ws && typeof ws.terminate === 'function') {
-                        ws.terminate();
                     }
                 } catch (error) {
                     logger.error(`Failed to close WebSocket ${streamName}:`, error.message);

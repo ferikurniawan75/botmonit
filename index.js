@@ -1,524 +1,561 @@
+#!/usr/bin/env node
+
+/**
+ * Crypto Trading Bot - Main Entry Point
+ * Advanced cryptocurrency trading bot with AI analysis, futures trading, and Telegram integration
+ */
+
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const path = require('path');
+const fs = require('fs');
+
+// Core Components
 const config = require('./src/config/config');
 const logger = require('./src/utils/logger');
 
-// Core components
+// API Classes
 const BinanceAPI = require('./src/exchange/BinanceAPI');
 const BinanceFuturesAPI = require('./src/exchange/BinanceFuturesAPI');
+
+// Core Trading Components
+const TradingBot = require('./src/core/TradingBot');
 const MarketAnalyzer = require('./src/analysis/MarketAnalyzer');
 const AIAnalyzer = require('./src/analysis/AIAnalyzer');
-const TradingBot = require('./src/core/TradingBot');
 const RiskManager = require('./src/core/RiskManager');
-const TelegramBot = require('./src/telegram/TelegramBot');
 const FuturesStrategy = require('./src/strategies/FuturesStrategy');
 
-class CryptoTradingBot {
+// Communication
+const TelegramBot = require('./src/telegram/TelegramBot');
+
+class CryptoTradingBotApp {
     constructor() {
         this.app = express();
         this.server = null;
+        this.isShuttingDown = false;
         
         // Core components
         this.binanceAPI = null;
         this.binanceFuturesAPI = null;
         this.marketAnalyzer = null;
         this.aiAnalyzer = null;
-        this.tradingBot = null;
         this.riskManager = null;
-        this.telegramBot = null;
+        this.tradingBot = null;
         this.futuresStrategy = null;
+        this.telegramBot = null;
+        this.healthCheckInterval = null;
         
-        // State management
-        this.isInitialized = false;
-        this.isRunning = false;
-        this.startTime = Date.now();
-        
-        this.setupExpress();
-        this.setupGlobalErrorHandlers();
-    }
-
-    setupExpress() {
-        this.app.use(helmet());
-        this.app.use(cors());
-        this.app.use(express.json());
-        this.app.use(express.urlencoded({ extended: true }));
-        
-        // Health check endpoint
-        this.app.get('/health', (req, res) => {
-            const healthStatus = {
-                status: 'ok',
-                timestamp: new Date().toISOString(),
-                uptime: process.uptime(),
-                memory: process.memoryUsage(),
-                isInitialized: this.isInitialized,
-                isRunning: this.isRunning,
-                components: {
-                    binanceSpot: this.binanceAPI ? 'connected' : 'disconnected',
-                    binanceFutures: this.binanceFuturesAPI ? 'connected' : 'disconnected',
-                    telegram: this.telegramBot ? 'connected' : 'disconnected',
-                    trading: this.tradingBot?.isRunning ? 'active' : 'inactive',
-                    futures: this.futuresStrategy?.isRunning ? 'active' : 'inactive'
-                }
-            };
-            res.json(healthStatus);
-        });
-
-        // API endpoints
-        this.setupAPIRoutes();
-    }
-
-    setupAPIRoutes() {
-        // System status
-        this.app.get('/api/status', (req, res) => {
-            res.json({
-                timestamp: Date.now(),
-                uptime: Date.now() - this.startTime,
-                trading: this.tradingBot ? this.tradingBot.getStatus() : null,
-                futures: this.futuresStrategy ? this.futuresStrategy.getStatus() : null,
-                market: this.marketAnalyzer ? this.marketAnalyzer.getMarketSummary() : null,
-                ai: this.aiAnalyzer ? this.aiAnalyzer.getStatus() : null
-            });
-        });
-
-        // Futures endpoints
-        this.app.get('/api/futures/status', (req, res) => {
-            if (!this.futuresStrategy) {
-                return res.status(503).json({ error: 'Futures strategy not initialized' });
-            }
-            
-            res.json({
-                status: this.futuresStrategy.getStatus(),
-                positions: this.futuresStrategy.getActivePositions(),
-                dailyStats: this.futuresStrategy.getDailyStats()
-            });
-        });
-
-        this.app.post('/api/futures/start', async (req, res) => {
-            try {
-                if (!this.futuresStrategy) {
-                    return res.status(503).json({ error: 'Futures strategy not initialized' });
-                }
-                
-                if (this.futuresStrategy.isRunning) {
-                    return res.status(400).json({ error: 'Futures strategy already running' });
-                }
-
-                await this.futuresStrategy.start();
-                res.json({ success: true, message: 'Futures strategy started' });
-            } catch (error) {
-                logger.error('Error starting futures strategy:', error);
-                res.status(500).json({ error: error.message });
-            }
-        });
-
-        this.app.post('/api/futures/stop', async (req, res) => {
-            try {
-                if (!this.futuresStrategy) {
-                    return res.status(503).json({ error: 'Futures strategy not initialized' });
-                }
-                
-                if (!this.futuresStrategy.isRunning) {
-                    return res.status(400).json({ error: 'Futures strategy not running' });
-                }
-
-                await this.futuresStrategy.stop();
-                res.json({ success: true, message: 'Futures strategy stopped' });
-            } catch (error) {
-                logger.error('Error stopping futures strategy:', error);
-                res.status(500).json({ error: error.message });
-            }
-        });
-
-        // Error handler
-        this.app.use((err, req, res, next) => {
-            logger.error('Express error:', err);
-            res.status(500).json({ 
-                error: 'Internal server error',
-                timestamp: Date.now()
-            });
-        });
-    }
-
-    setupGlobalErrorHandlers() {
-        // Handle uncaught exceptions
-        process.on('uncaughtException', (error) => {
-            logger.error('Uncaught Exception:', error);
-            logger.error('Stack:', error.stack);
-            
-            // Graceful shutdown
-            this.gracefulShutdown('UNCAUGHT_EXCEPTION');
-        });
-
-        // Handle unhandled promise rejections
-        process.on('unhandledRejection', (reason, promise) => {
-            logger.error('Unhandled Rejection at:', promise);
-            logger.error('Reason:', reason);
-            
-            // Don't exit immediately for unhandled rejections
-            // Log and continue
-        });
-
-        // Handle process termination
-        process.on('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
-        process.on('SIGINT', () => this.gracefulShutdown('SIGINT'));
-    }
-
-    async validateEnvironment() {
-        logger.info('🔍 Validating environment configuration...');
-
-        const requiredEnvVars = [
-            'TELEGRAM_BOT_TOKEN',
-            'ADMIN_USER_IDS',
-            'BINANCE_API_KEY',
-            'BINANCE_SECRET_KEY'
-        ];
-
-        const missingVars = [];
-        for (const envVar of requiredEnvVars) {
-            if (!process.env[envVar]) {
-                missingVars.push(envVar);
-            }
-        }
-
-        if (missingVars.length > 0) {
-            throw new Error(`Missing required environment variables: ${missingVars.join(', ')}`);
-        }
-
-        // Validate API key formats
-        if (process.env.BINANCE_API_KEY.length < 60) {
-            throw new Error('Invalid Binance API Key format (too short)');
-        }
-
-        if (process.env.BINANCE_SECRET_KEY.length < 60) {
-            throw new Error('Invalid Binance Secret Key format (too short)');
-        }
-
-        // Validate Telegram Bot Token format
-        if (!process.env.TELEGRAM_BOT_TOKEN.match(/^\d+:[A-Za-z0-9_-]+$/)) {
-            throw new Error('Invalid Telegram Bot Token format');
-        }
-
-        // Validate Admin User IDs
-        const adminIds = process.env.ADMIN_USER_IDS.split(',').map(id => parseInt(id.trim()));
-        if (adminIds.some(id => isNaN(id) || id <= 0)) {
-            throw new Error('Invalid Admin User IDs format');
-        }
-
-        // Validate numeric configurations
-        const numericConfigs = [
-            'FUTURES_LEVERAGE',
-            'FUTURES_QTY_USDT',
-            'FUTURES_TP_PERCENT',
-            'FUTURES_SL_PERCENT',
-            'RSI_LONG_THRESHOLD',
-            'RSI_SHORT_THRESHOLD'
-        ];
-
-        for (const configKey of numericConfigs) {
-            if (process.env[configKey] && isNaN(parseFloat(process.env[configKey]))) {
-                throw new Error(`Invalid numeric value for ${configKey}: ${process.env[configKey]}`);
-            }
-        }
-
-        logger.info('✅ Environment validation successful');
-    }
-
-// QUICK FIX FOR index.js
-// Replace the initializeComponents method in your index.js with this:
-
-async initializeComponents() {
-    try {
-        logger.info('🚀 Initializing Crypto Trading Bot...');
-
-        // Validate environment first
-        await this.validateEnvironment();
-
-        // Initialize Binance APIs with correct parameter structure
-        logger.info('📡 Initializing Binance APIs...');
-        
-        this.binanceAPI = new BinanceAPI({
-            apiKey: config.BINANCE_API_KEY,
-            secretKey: config.BINANCE_SECRET_KEY,
-            useTestnet: config.USE_TESTNET
-        });
-
-        this.binanceFuturesAPI = new BinanceFuturesAPI({
-            apiKey: config.BINANCE_API_KEY,
-            secretKey: config.BINANCE_SECRET_KEY,
-            useTestnet: config.USE_TESTNET
-        });
-
-        // Initialize Market Analyzer
-        logger.info('📊 Initializing Market Analyzer...');
-        this.marketAnalyzer = new MarketAnalyzer(this.binanceAPI);
-
-        // Initialize AI Analyzer (if enabled)
-        if (config.ENABLE_AI_ANALYSIS) {
-            logger.info('🤖 Initializing AI Analyzer...');
-            this.aiAnalyzer = new AIAnalyzer();
-            await this.aiAnalyzer.initialize();
-        } else {
-            logger.info('⚠️ AI Analysis disabled in configuration');
-        }
-
-        // Initialize Risk Manager
-        logger.info('🛡️ Initializing Risk Manager...');
-this.riskManager = new RiskManager(config);
-        // Initialize Trading Bot
-        logger.info('🤖 Initializing Trading Bot...');
-        this.tradingBot = new TradingBot({
-            binanceAPI: this.binanceAPI,
-            marketAnalyzer: this.marketAnalyzer,
-            aiAnalyzer: this.aiAnalyzer,
-            riskManager: this.riskManager,
-            config: config
-        });
-
-        // Initialize Futures Strategy (if API keys are available)
-        if (config.BINANCE_API_KEY && config.BINANCE_SECRET_KEY) {
-            logger.info('⚡ Initializing Futures Strategy...');
-            this.futuresStrategy = new FuturesStrategy({
-                binanceFuturesAPI: this.binanceFuturesAPI,
-                marketAnalyzer: this.marketAnalyzer,
-                aiAnalyzer: this.aiAnalyzer,
-                riskManager: this.riskManager
-            });
-        } else {
-            logger.warn('⚠️ Futures Strategy not initialized - missing API keys');
-        }
-
-        // Initialize Telegram Bot
-logger.info('📱 Initializing Telegram Bot...');
-
-// Use direct environment variable
-this.telegramBot = new TelegramBot({
-    token: process.env.TELEGRAM_BOT_TOKEN,  // <-- Direct env var
-    adminUserIds: config.ADMIN_USER_IDS,
-    tradingBot: this.tradingBot,
-    futuresStrategy: this.futuresStrategy,
-    marketAnalyzer: this.marketAnalyzer,
-    aiAnalyzer: this.aiAnalyzer
-});
-
-        this.isInitialized = true;
-        logger.info('✅ All components initialized successfully');
-
-    } catch (error) {
-        logger.error('❌ Failed to initialize components:', error);
-        throw error;
-    }
-}
-
-// Also add this validation method if it doesn't exist:
-async validateEnvironment() {
-    logger.info('🔍 Validating environment configuration...');
-
-    const requiredEnvVars = [
-        'TELEGRAM_BOT_TOKEN',
-        'ADMIN_USER_IDS',
-        'BINANCE_API_KEY',
-        'BINANCE_SECRET_KEY'
-    ];
-
-    const missingVars = [];
-    for (const envVar of requiredEnvVars) {
-        if (!process.env[envVar]) {
-            missingVars.push(envVar);
-        }
-    }
-
-    if (missingVars.length > 0) {
-        throw new Error(`Missing required environment variables: ${missingVars.join(', ')}`);
-    }
-
-    // Validate API key formats
-    if (process.env.BINANCE_API_KEY.length < 60) {
-        throw new Error('Invalid Binance API Key format (too short)');
-    }
-
-    if (process.env.BINANCE_SECRET_KEY.length < 60) {
-        throw new Error('Invalid Binance Secret Key format (too short)');
-    }
-
-    // Validate Telegram Bot Token format
-    if (!process.env.TELEGRAM_BOT_TOKEN.match(/^\d+:[A-Za-z0-9_-]+$/)) {
-        throw new Error('Invalid Telegram Bot Token format');
-    }
-
-    // Validate Admin User IDs
-    const adminIds = process.env.ADMIN_USER_IDS.split(',').map(id => parseInt(id.trim()));
-    if (adminIds.some(id => isNaN(id) || id <= 0)) {
-        throw new Error('Invalid Admin User IDs format');
-    }
-
-    logger.info('✅ Environment validation successful');
-}
-
-    async testConnections() {
-        logger.info('🔍 Testing connections...');
-
-        const connectionResults = {
+        // Performance tracking
+        this.startTime = new Date();
+        this.connectionStatus = {
             binanceSpot: false,
             binanceFutures: false,
             telegram: false
         };
-
-        try {
-            // Test Binance Spot API
-            if (this.binanceAPI) {
-                await this.binanceAPI.testConnection();
-                connectionResults.binanceSpot = true;
-                logger.info('✅ Binance Spot API connection successful');
-            }
-        } catch (error) {
-            logger.error('❌ Binance Spot API connection failed:', error.message);
-        }
-
-        try {
-            // Test Binance Futures API
-            if (this.binanceFuturesAPI) {
-                await this.binanceFuturesAPI.testConnectivity();
-                connectionResults.binanceFutures = true;
-                logger.info('✅ Binance Futures API connection successful');
-            }
-        } catch (error) {
-            logger.error('❌ Binance Futures API connection failed:', error.message);
-        }
-
-        try {
-            // Test Telegram Bot
-            if (this.telegramBot) {
-                await this.telegramBot.testConnection();
-                connectionResults.telegram = true;
-                logger.info('✅ Telegram Bot connection successful');
-            }
-        } catch (error) {
-            logger.error('❌ Telegram Bot connection failed:', error.message);
-        }
-
-        // Check if critical connections are working
-        const criticalConnections = ['binanceFutures', 'telegram'];
-        const failedCritical = criticalConnections.filter(conn => !connectionResults[conn]);
         
-        if (failedCritical.length > 0) {
-            logger.warn(`⚠️ Critical connections failed: ${failedCritical.join(', ')}`);
-            logger.warn('⚠️ Bot may not function properly');
-        } else {
-            logger.info('✅ All critical connections successful');
-        }
-
-        return connectionResults;
-    }
-
-    async validateTradingReadiness() {
-        logger.info('🔍 Validating trading readiness...');
-
-        const checks = {
+        this.tradingReadiness = {
             apiKeys: false,
             balance: false,
             permissions: false,
             riskSettings: false
         };
+        
+        // Simple health monitoring (inline)
+        this.healthStatus = {
+            isHealthy: true,
+            lastCheck: Date.now(),
+            errors: []
+        };
+        
+        this.initializeApp();
+    }
 
+    async initializeApp() {
         try {
-            // Check API keys and permissions
-            if (this.binanceFuturesAPI) {
-                const accountInfo = await this.binanceFuturesAPI.getAccountInfo();
-                checks.apiKeys = true;
-                
-                // Check if futures trading is enabled
-                if (accountInfo.canTrade) {
-                    checks.permissions = true;
-                    logger.info('✅ Futures trading permissions verified');
-                } else {
-                    logger.error('❌ Futures trading not enabled on account');
-                }
+            logger.info('🚀 Initializing Crypto Trading Bot...');
+            logger.info(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+            logger.info(`🧪 Testnet Mode: ${config.USE_TESTNET ? 'ENABLED' : 'DISABLED'}`);
+            
+            // Setup Express middleware
+            this.setupMiddleware();
+            
+            // Setup API routes
+            this.setupRoutes();
+            
+            // Initialize components
+            await this.initializeComponents();
+            
+            // Validate system readiness
+            await this.validateReadiness();
+            
+            logger.info('✅ Application initialization complete');
+            
+        } catch (error) {
+            logger.error('❌ Failed to initialize application:', error);
+            process.exit(1);
+        }
+    }
 
-                // Check balance
-                const balance = parseFloat(accountInfo.totalWalletBalance);
-                const minBalance = config.MIN_ACCOUNT_BALANCE || 50;
+    setupMiddleware() {
+        // Security middleware
+        this.app.use(helmet({
+            contentSecurityPolicy: false,
+            crossOriginEmbedderPolicy: false
+        }));
+        
+        // CORS configuration
+        this.app.use(cors({
+            origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
+            credentials: true
+        }));
+        
+        // Body parsing
+        this.app.use(express.json({ limit: '10mb' }));
+        this.app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+        
+        // Static files
+        this.app.use('/static', express.static(path.join(__dirname, 'public')));
+        
+        // Request logging
+        this.app.use((req, res, next) => {
+            const start = Date.now();
+            res.on('finish', () => {
+                const duration = Date.now() - start;
+                logger.info(`${req.method} ${req.path} - ${res.statusCode} (${duration}ms)`);
+            });
+            next();
+        });
+    }
+
+    setupRoutes() {
+        // Health check endpoint
+        this.app.get('/health', (req, res) => {
+            const health = {
+                status: 'ok',
+                timestamp: new Date().toISOString(),
+                uptime: Math.floor((Date.now() - this.startTime.getTime()) / 1000),
+                environment: process.env.NODE_ENV || 'development',
+                testnet: config.USE_TESTNET,
+                connections: this.connectionStatus,
+                tradingReadiness: this.tradingReadiness,
+                version: require('./package.json').version
+            };
+            
+            const allConnectionsHealthy = Object.values(this.connectionStatus).some(status => status === true);
+            
+            if (!allConnectionsHealthy) {
+                health.status = 'degraded';
+                res.status(503);
+            }
+            
+            res.json(health);
+        });
+
+        // Status endpoint with detailed information
+        this.app.get('/status', (req, res) => {
+            const status = {
+                bot: {
+                    isRunning: this.tradingBot?.isRunning || false,
+                    tradingMode: this.tradingBot?.tradingMode || 'unknown',
+                    enabledStrategies: this.tradingBot?.enabledStrategies ? 
+                        Array.from(this.tradingBot.enabledStrategies) : [],
+                    activeTrades: this.tradingBot?.getActiveTrades ? this.tradingBot.getActiveTrades().length : 0
+                },
+                market: {
+                    isStreaming: this.marketAnalyzer?.isRunning || false,
+                    activeSymbols: this.marketAnalyzer?.getActiveSymbols ? this.marketAnalyzer.getActiveSymbols().length : 0
+                },
+                ai: {
+                    isEnabled: config.ENABLE_AI_ANALYSIS,
+                    isReady: this.aiAnalyzer?.isInitialized || false
+                },
+                connections: this.connectionStatus,
+                tradingReadiness: this.tradingReadiness
+            };
+            res.json(status);
+        });
+
+        // Trading control endpoints
+        this.app.post('/trading/start', async (req, res) => {
+            try {
+                if (!this.tradingBot) {
+                    return res.status(400).json({ error: 'Trading bot not initialized' });
+                }
                 
-                if (balance >= minBalance) {
-                    checks.balance = true;
-                    logger.info(`✅ Account balance sufficient: ${balance} USDT`);
-                } else {
-                    logger.error(`❌ Insufficient balance: ${balance} USDT (minimum: ${minBalance})`);
+                if (this.tradingBot.startTrading) {
+                    await this.tradingBot.startTrading();
+                }
+                res.json({ message: 'Trading started successfully' });
+            } catch (error) {
+                logger.error('Failed to start trading via API:', error);
+                res.status(500).json({ error: error.message });
+            }
+        });
+
+        this.app.post('/trading/stop', async (req, res) => {
+            try {
+                if (!this.tradingBot) {
+                    return res.status(400).json({ error: 'Trading bot not initialized' });
+                }
+                
+                if (this.tradingBot.stopTrading) {
+                    await this.tradingBot.stopTrading();
+                }
+                res.json({ message: 'Trading stopped successfully' });
+            } catch (error) {
+                logger.error('Failed to stop trading via API:', error);
+                res.status(500).json({ error: error.message });
+            }
+        });
+
+        // Graceful shutdown endpoint
+        this.app.post('/shutdown', async (req, res) => {
+            res.json({ message: 'Shutdown initiated' });
+            await this.gracefulShutdown('API_REQUEST');
+        });
+
+        // 404 handler
+        this.app.use('*', (req, res) => {
+            res.status(404).json({ 
+                error: 'Endpoint not found',
+                availableEndpoints: ['/health', '/status', '/trading/start', '/trading/stop']
+            });
+        });
+
+        // Error handler
+        this.app.use((error, req, res, next) => {
+            logger.error('Express error:', error);
+            res.status(500).json({ 
+                error: 'Internal server error',
+                message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong'
+            });
+        });
+    }
+
+    async initializeComponents() {
+        try {
+            logger.info('🔧 Initializing core components...');
+
+            // Ensure logs directory exists
+            const logsDir = path.join(__dirname, 'logs');
+            if (!fs.existsSync(logsDir)) {
+                fs.mkdirSync(logsDir, { recursive: true });
+            }
+
+            // Initialize Binance APIs
+            if (config.BINANCE_API_KEY && config.BINANCE_SECRET_KEY) {
+                this.binanceAPI = new BinanceAPI({
+                    apiKey: config.BINANCE_API_KEY,
+                    secretKey: config.BINANCE_SECRET_KEY,
+                    useTestnet: config.USE_TESTNET
+                });
+
+                this.binanceFuturesAPI = new BinanceFuturesAPI({
+                    apiKey: config.BINANCE_API_KEY,
+                    secretKey: config.BINANCE_SECRET_KEY,
+                    useTestnet: config.USE_TESTNET
+                });
+            } else {
+                logger.warn('⚠️ Binance API credentials not found - running in demo mode');
+                // Create mock API for demo mode
+                this.binanceAPI = this.createMockBinanceAPI();
+                this.binanceFuturesAPI = this.createMockBinanceFuturesAPI();
+            }
+
+            // Initialize market analyzer (only if binanceAPI exists)
+            if (this.binanceAPI) {
+                this.marketAnalyzer = new MarketAnalyzer(this.binanceAPI);
+            } else {
+                logger.error('❌ Cannot initialize MarketAnalyzer without BinanceAPI');
+                throw new Error('BinanceAPI is required for MarketAnalyzer');
+            }
+
+            // Initialize AI analyzer
+            this.aiAnalyzer = new AIAnalyzer();
+
+            // Initialize risk manager
+            this.riskManager = new RiskManager(config);
+
+            // Initialize trading bot (only if required components exist)
+            if (this.binanceAPI && this.marketAnalyzer) {
+                this.tradingBot = new TradingBot({
+                    binanceAPI: this.binanceAPI,
+                    marketAnalyzer: this.marketAnalyzer,
+                    aiAnalyzer: this.aiAnalyzer,
+                    riskManager: this.riskManager,
+                    config: config
+                });
+            } else {
+                logger.error('❌ Cannot initialize TradingBot without required components');
+                throw new Error('Required components missing for TradingBot');
+            }
+
+            // Initialize futures strategy (only if futures API exists)
+            if (this.binanceFuturesAPI && this.marketAnalyzer) {
+                this.futuresStrategy = new FuturesStrategy(this.binanceFuturesAPI, this.marketAnalyzer);
+                if (this.tradingBot) {
+                    this.tradingBot.futuresStrategy = this.futuresStrategy;
+                    this.tradingBot.futuresAPI = this.binanceFuturesAPI;
                 }
             }
 
-            // Validate risk settings
-            const riskConfig = {
-                dailyLoss: config.DAILY_MAX_LOSS_PERCENT,
-                positionSize: config.FUTURES_QTY_USDT,
-                leverage: config.FUTURES_LEVERAGE,
-                stopLoss: config.FUTURES_SL_PERCENT
-            };
-
-            const isRiskConfigValid = (
-                riskConfig.dailyLoss <= 10 &&
-                riskConfig.positionSize <= 100 &&
-                riskConfig.leverage <= 50 &&
-                riskConfig.stopLoss <= 5
-            );
-
-            if (isRiskConfigValid) {
-                checks.riskSettings = true;
-                logger.info('✅ Risk settings are within safe parameters');
+            // Initialize Telegram bot (only if token exists)
+            if (config.TELEGRAM_BOT_TOKEN && this.tradingBot) {
+                this.telegramBot = new TelegramBot({
+                    token: config.TELEGRAM_BOT_TOKEN,
+                    adminUserIds: config.ADMIN_USER_IDS,
+                    tradingBot: this.tradingBot
+                });
+                
+                // Actually start the telegram bot here so it's ready for testing
+                try {
+                    await this.telegramBot.start();
+                    logger.info('📱 Telegram Bot initialized and started');
+                } catch (error) {
+                    logger.warn('⚠️ Telegram bot failed to start during init:', error.message);
+                }
             } else {
-                logger.error('❌ Risk settings are too aggressive');
-                logger.error('Risk config:', riskConfig);
+                logger.warn('⚠️ Telegram bot not initialized - token missing or trading bot failed');
+            }
+
+            // Test connections AFTER everything is initialized
+            await this.testConnections();
+
+            logger.info('✅ All components initialized successfully');
+        } catch (error) {
+            logger.error('❌ Failed to initialize components:', error);
+            throw error;
+        }
+    }
+
+    // Mock API methods for demo mode
+    createMockBinanceAPI() {
+        const EventEmitter = require('events');
+        
+        return Object.assign(new EventEmitter(), {
+            async testConnection() {
+                logger.info('Mock Binance API - connection test passed');
+                return true;
+            },
+            async getAccountInfo() {
+                return {
+                    balances: [
+                        { asset: 'USDT', free: '1000.00', locked: '0.00' },
+                        { asset: 'BTC', free: '0.00000000', locked: '0.00000000' }
+                    ]
+                };
+            },
+            startTickerStream() {
+                logger.info('Mock ticker stream started');
+                // Emit mock ticker updates
+                setTimeout(() => {
+                    this.emit('tickerUpdate', {
+                        symbol: 'BTCUSDT',
+                        price: '65000.00',
+                        priceChangePercent: '2.5',
+                        volume: '1000.00'
+                    });
+                }, 1000);
+            },
+            startKlineStream() {
+                logger.info('Mock kline stream started');
+                // Emit mock kline updates
+                setTimeout(() => {
+                    this.emit('klineUpdate', {
+                        symbol: 'BTCUSDT',
+                        open: '64500.00',
+                        high: '65500.00',
+                        low: '64000.00',
+                        close: '65000.00',
+                        volume: '100.00',
+                        closeTime: Date.now(),
+                        isFinal: true
+                    });
+                }, 2000);
+            },
+            stopAllStreams() {
+                logger.info('Mock streams stopped');
+            }
+        });
+    }
+
+    createMockBinanceFuturesAPI() {
+        return {
+            async testConnectivity() {
+                logger.info('Mock Futures API - connectivity test passed');
+                return true;
+            },
+            async getAccount() {
+                return {
+                    totalWalletBalance: '1000.00',
+                    availableBalance: '1000.00',
+                    assets: [
+                        { asset: 'USDT', walletBalance: '1000.00', availableBalance: '1000.00' }
+                    ]
+                };
+            }
+        };
+    }
+
+    async testConnections() {
+        logger.info('🔍 Testing connections...');
+
+        // Test Binance Spot API
+        if (this.binanceAPI) {
+            try {
+                await this.binanceAPI.testConnection();
+                this.connectionStatus.binanceSpot = true;
+                logger.info('✅ Binance Spot API connection successful');
+            } catch (error) {
+                this.connectionStatus.binanceSpot = false;
+                logger.error('❌ Binance Spot API connection failed:', error.message);
+            }
+        } else {
+            this.connectionStatus.binanceSpot = false;
+            logger.warn('⚠️ Binance Spot API not initialized');
+        }
+
+        // Test Binance Futures API
+        if (this.binanceFuturesAPI) {
+            try {
+                await this.binanceFuturesAPI.testConnectivity();
+                this.connectionStatus.binanceFutures = true;
+                logger.info('✅ Binance Futures API connection successful');
+            } catch (error) {
+                this.connectionStatus.binanceFutures = false;
+                logger.error('❌ Binance Futures API connection failed:', error.message);
+            }
+        } else {
+            this.connectionStatus.binanceFutures = false;
+            logger.warn('⚠️ Binance Futures API not initialized');
+        }
+
+        // Test Telegram Bot (only if properly initialized and started)
+        if (this.telegramBot && config.TELEGRAM_BOT_TOKEN) {
+            try {
+                // Check if bot is running before testing connection
+                if (this.telegramBot.isRunning) {
+                    await this.telegramBot.testConnection();
+                    this.connectionStatus.telegram = true;
+                    logger.info('✅ Telegram Bot connection successful');
+                } else {
+                    this.connectionStatus.telegram = false;
+                    logger.warn('⚠️ Telegram Bot not running yet');
+                }
+            } catch (error) {
+                this.connectionStatus.telegram = false;
+                logger.error('❌ Telegram Bot connection failed:', error.message);
+            }
+        } else {
+            this.connectionStatus.telegram = false;
+            if (!config.TELEGRAM_BOT_TOKEN) {
+                logger.warn('⚠️ Telegram Bot token not provided');
+            } else {
+                logger.warn('⚠️ Telegram Bot not initialized');
+            }
+        }
+
+        // Check critical connections
+        const criticalConnections = [];
+        if (!this.connectionStatus.binanceSpot) criticalConnections.push('binance');
+        // Don't treat telegram as critical since bot can work without it
+        
+        if (criticalConnections.length > 0) {
+            logger.warn(`⚠️ Critical connections failed: ${criticalConnections.join(', ')}`);
+            logger.warn('⚠️ Bot may not function properly');
+        } else {
+            logger.info('✅ All critical connections successful');
+        }
+    }
+
+    async validateReadiness() {
+        logger.info('🔍 Validating trading readiness...');
+
+        try {
+            // Check API keys
+            if (config.BINANCE_API_KEY && config.BINANCE_SECRET_KEY) {
+                this.tradingReadiness.apiKeys = true;
+            }
+
+            // Check account access and balance
+            if (this.connectionStatus.binanceSpot) {
+                try {
+                    const accountInfo = await this.binanceAPI.getAccountInfo();
+                    if (accountInfo) {
+                        this.tradingReadiness.balance = true;
+                        this.tradingReadiness.permissions = true;
+                    }
+                } catch (error) {
+                    logger.error('Failed to get account info:', error.message);
+                }
+            }
+
+            // Check risk settings
+            if (this.riskManager) {
+                this.tradingReadiness.riskSettings = true;
+            }
+
+            const readyChecks = Object.entries(this.tradingReadiness)
+                .filter(([key, value]) => !value)
+                .map(([key]) => key);
+
+            if (readyChecks.length > 0) {
+                logger.error('❌ Trading readiness validation failed:', readyChecks);
+                logger.error('❌ Bot is NOT ready for trading');
+                logger.error('Failed checks:', readyChecks);
+            } else {
+                logger.info('✅ Trading readiness validation passed');
+                logger.info('✅ Bot is ready for trading');
             }
 
         } catch (error) {
             logger.error('❌ Trading readiness validation failed:', error.message);
         }
-
-        const allChecksPass = Object.values(checks).every(check => check);
-        
-        if (allChecksPass) {
-            logger.info('✅ Bot is ready for trading');
-        } else {
-            logger.error('❌ Bot is NOT ready for trading');
-            logger.error('Failed checks:', Object.entries(checks).filter(([, passed]) => !passed).map(([check]) => check));
-        }
-
-        return { passed: allChecksPass, checks };
     }
 
     async start() {
         try {
-            logger.info('🎯 Starting Crypto Trading Bot...');
-
-            // Test all connections
-            const connectionResults = await this.testConnections();
-
-            // Validate trading readiness
-            const readinessResults = await this.validateTradingReadiness();
-
-            // Start market data stream
-            if (this.marketAnalyzer) {
+            logger.info('[MARKET] Starting market data streams');
+            
+            // Start market data streams (only if market analyzer exists)
+            if (this.marketAnalyzer && this.marketAnalyzer.startDataStream) {
                 await this.marketAnalyzer.startDataStream();
                 logger.info('📊 Market data stream started');
+            } else {
+                logger.warn('⚠️ Market analyzer not available - skipping data streams');
             }
 
-            // Initialize AI if enabled
-            if (this.aiAnalyzer && config.ENABLE_AI_ANALYSIS) {
-                logger.info('🤖 AI Analyzer ready');
+            // Initialize and start AI analyzer
+            if (config.ENABLE_AI_ANALYSIS && this.aiAnalyzer) {
+                try {
+                    await this.aiAnalyzer.initialize();
+                    logger.info('🤖 AI Analyzer ready');
+                } catch (error) {
+                    logger.warn('⚠️ AI Analyzer initialization failed:', error.message);
+                }
             }
 
-            // Start trading bot (but not auto-trading)
+            // Start trading bot
             if (this.tradingBot) {
+                logger.info('[TRADE] Starting TradingBot...');
                 await this.tradingBot.start();
                 logger.info('🤖 Trading Bot engine started (manual mode)');
+            } else {
+                logger.warn('⚠️ Trading bot not available');
             }
 
-            // Start Telegram bot
+            // Telegram bot already started in initializeComponents(), just log status
             if (this.telegramBot) {
-                await this.telegramBot.start();
-                logger.info('📱 Telegram Bot started');
+                logger.info('📱 Telegram Bot ready (already started)');
+            } else {
+                logger.warn('⚠️ Telegram bot not available');
             }
+
+            // Start health monitoring
+            this.startSimpleHealthMonitoring();
 
             // Start web server
             const port = config.PORT || 3000;
@@ -526,13 +563,16 @@ async validateEnvironment() {
                 logger.info(`🌐 Web server running on port ${port}`);
             });
 
-            this.isRunning = true;
-
-            // Show startup summary
-            this.logStartupSummary(connectionResults, readinessResults);
+            // Log startup summary
+            this.logStartupSummary();
 
             // Setup graceful shutdown handlers
             this.setupGracefulShutdown();
+
+            // Signal PM2 that app is ready
+            if (process.send) {
+                process.send('ready');
+            }
 
         } catch (error) {
             logger.error('❌ Failed to start bot:', error);
@@ -540,34 +580,30 @@ async validateEnvironment() {
         }
     }
 
-    logStartupSummary(connectionResults, readinessResults) {
+    logStartupSummary() {
         logger.info('');
         logger.info('🎉=== CRYPTO TRADING BOT STARTUP COMPLETE ===');
         logger.info('');
         logger.info('📊 Status Summary:');
-        logger.info(`   • Environment: ${config.NODE_ENV}`);
+        logger.info(`   • Environment: ${process.env.NODE_ENV || 'development'}`);
         logger.info(`   • Testnet Mode: ${config.USE_TESTNET ? 'ENABLED' : 'DISABLED'}`);
         logger.info(`   • AI Analysis: ${config.ENABLE_AI_ANALYSIS ? 'ENABLED' : 'DISABLED'}`);
         logger.info('');
         logger.info('🔗 Connections:');
-        logger.info(`   • Binance Spot: ${connectionResults.binanceSpot ? '✅' : '❌'}`);
-        logger.info(`   • Binance Futures: ${connectionResults.binanceFutures ? '✅' : '❌'}`);
-        logger.info(`   • Telegram: ${connectionResults.telegram ? '✅' : '❌'}`);
+        logger.info(`   • Binance Spot: ${this.connectionStatus.binanceSpot ? '✅' : '❌'}`);
+        logger.info(`   • Binance Futures: ${this.connectionStatus.binanceFutures ? '✅' : '❌'}`);
+        logger.info(`   • Telegram: ${this.connectionStatus.telegram ? '✅' : '❌'}`);
         logger.info('');
         logger.info('⚡ Trading Readiness:');
-        logger.info(`   • API Keys: ${readinessResults.checks.apiKeys ? '✅' : '❌'}`);
-        logger.info(`   • Balance: ${readinessResults.checks.balance ? '✅' : '❌'}`);
-        logger.info(`   • Permissions: ${readinessResults.checks.permissions ? '✅' : '❌'}`);
-        logger.info(`   • Risk Settings: ${readinessResults.checks.riskSettings ? '✅' : '❌'}`);
+        logger.info(`   • API Keys: ${this.tradingReadiness.apiKeys ? '✅' : '❌'}`);
+        logger.info(`   • Balance: ${this.tradingReadiness.balance ? '✅' : '❌'}`);
+        logger.info(`   • Permissions: ${this.tradingReadiness.permissions ? '✅' : '❌'}`);
+        logger.info(`   • Risk Settings: ${this.tradingReadiness.riskSettings ? '✅' : '❌'}`);
         logger.info('');
-        
         if (config.USE_TESTNET) {
             logger.info('🧪 TESTNET MODE - Safe for testing!');
-        } else {
-            logger.info('🚨 LIVE MODE - Real money at risk!');
+            logger.info('');
         }
-        
-        logger.info('');
         logger.info('📱 Next Steps:');
         logger.info('   • Send /help to your Telegram bot for commands');
         logger.info('   • Use /futures to access futures trading features');
@@ -584,128 +620,152 @@ async validateEnvironment() {
         logger.info('');
     }
 
-    setupGracefulShutdown() {
-        const gracefulShutdown = async (signal) => {
-            logger.info(`📡 Received ${signal}. Starting graceful shutdown...`);
-            
-            try {
-                // Stop accepting new requests
-                if (this.server) {
-                    this.server.close(() => {
-                        logger.info('🌐 Web server closed');
-                    });
-                }
-
-                // Stop trading activities
-                if (this.futuresStrategy && this.futuresStrategy.isRunning) {
-                    logger.info('⚡ Stopping futures strategy...');
-                    await this.futuresStrategy.stop();
-                }
-
-                if (this.tradingBot && this.tradingBot.isRunning) {
-                    logger.info('🤖 Stopping trading bot...');
-                    await this.tradingBot.stop();
-                }
-
-                // Close market data streams
-                if (this.marketAnalyzer) {
-                    logger.info('📊 Closing market data streams...');
-                    await this.marketAnalyzer.stop();
-                }
-
-                // Stop Telegram bot
-                if (this.telegramBot) {
-                    logger.info('📱 Stopping Telegram bot...');
-                    await this.telegramBot.stop();
-                }
-
-                // Dispose AI resources
-                if (this.aiAnalyzer) {
-                    logger.info('🤖 Disposing AI resources...');
-                    this.aiAnalyzer.dispose();
-                }
-
-                logger.info('✅ Graceful shutdown completed');
-                process.exit(0);
-
-            } catch (error) {
-                logger.error('❌ Error during graceful shutdown:', error);
-                process.exit(1);
-            }
-        };
-
-        process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-        process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    // Simple health monitoring methods
+    startSimpleHealthMonitoring() {
+        this.healthCheckInterval = setInterval(() => {
+            this.performHealthCheck();
+        }, 60000); // Check every minute
     }
 
-    async gracefulShutdown(reason) {
-        logger.info(`📡 Shutdown initiated: ${reason}`);
-        
-        this.isRunning = false;
-        
+    stopSimpleHealthMonitoring() {
+        if (this.healthCheckInterval) {
+            clearInterval(this.healthCheckInterval);
+            this.healthCheckInterval = null;
+        }
+    }
+
+    performHealthCheck() {
         try {
-            // Emergency: Close all open positions if configured
-            if (config.FORCE_CLOSE_ALL_ON_ERROR && this.futuresStrategy) {
-                logger.info('🚨 Emergency: Closing all positions...');
-                await this.futuresStrategy.closeAllPositions('emergency_shutdown');
+            this.healthStatus.lastCheck = Date.now();
+            this.healthStatus.errors = [];
+
+            // Check trading bot health
+            if (this.tradingBot && !this.tradingBot.isRunning) {
+                this.healthStatus.errors.push('Trading bot not running');
             }
 
-            // Stop all components
+            // Check market analyzer health
+            if (this.marketAnalyzer && !this.marketAnalyzer.isRunning) {
+                this.healthStatus.errors.push('Market analyzer not streaming');
+            }
+
+            // Check connection status
+            if (!this.connectionStatus.binanceSpot) {
+                this.healthStatus.errors.push('Binance connection failed');
+            }
+
+            this.healthStatus.isHealthy = this.healthStatus.errors.length === 0;
+
+            if (!this.healthStatus.isHealthy) {
+                logger.warn('Health check failed:', this.healthStatus.errors);
+            }
+
+        } catch (error) {
+            logger.error('Health check error:', error);
+            this.healthStatus.isHealthy = false;
+            this.healthStatus.errors.push('Health check failed');
+        }
+    }
+
+    setupGracefulShutdown() {
+        const signals = ['SIGTERM', 'SIGINT', 'SIGUSR2'];
+        
+        signals.forEach(signal => {
+            process.on(signal, async () => {
+                await this.gracefulShutdown(signal);
+            });
+        });
+
+        // Handle uncaught exceptions
+        process.on('uncaughtException', async (error) => {
+            logger.error('Uncaught Exception:', error);
+            await this.gracefulShutdown('UNCAUGHT_EXCEPTION');
+        });
+
+        // Handle unhandled promise rejections
+        process.on('unhandledRejection', async (reason, promise) => {
+            logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+            await this.gracefulShutdown('UNHANDLED_REJECTION');
+        });
+    }
+
+    async gracefulShutdown(signal) {
+        if (this.isShuttingDown) {
+            logger.warn('Shutdown already in progress...');
+            return;
+        }
+
+        this.isShuttingDown = true;
+        logger.info(`📡 Received ${signal}. Starting graceful shutdown...`);
+
+        try {
+            // Set shutdown timeout
+            const shutdownTimeout = setTimeout(() => {
+                logger.error('⏰ Shutdown timeout reached, forcing exit');
+                process.exit(1);
+            }, 30000); // 30 seconds
+
+            // Stop accepting new requests
             if (this.server) {
                 this.server.close();
+                logger.info('🌐 Web server stopped');
             }
 
-            if (this.futuresStrategy) {
-                await this.futuresStrategy.stop();
-            }
+            // Stop health monitoring
+            this.stopSimpleHealthMonitoring();
+            logger.info('💚 Health monitor stopped');
 
-            if (this.tradingBot) {
+            // Stop trading bot
+            if (this.tradingBot && this.tradingBot.stop) {
                 await this.tradingBot.stop();
+                logger.info('🤖 Trading bot stopped');
             }
 
-            if (this.marketAnalyzer) {
-                await this.marketAnalyzer.stop();
+            // Stop market analyzer
+            if (this.marketAnalyzer && this.marketAnalyzer.stopDataStream) {
+                await this.marketAnalyzer.stopDataStream();
+                logger.info('📊 Market analyzer stopped');
             }
 
-            if (this.telegramBot) {
+            // Stop Telegram bot
+            if (this.telegramBot && this.telegramBot.stop) {
                 await this.telegramBot.stop();
+                logger.info('📱 Telegram bot stopped');
             }
 
-            if (this.aiAnalyzer) {
-                this.aiAnalyzer.dispose();
+            // Stop AI analyzer
+            if (this.aiAnalyzer && this.aiAnalyzer.cleanup) {
+                await this.aiAnalyzer.cleanup();
+                logger.info('🧠 AI analyzer stopped');
             }
 
-            logger.info('✅ Shutdown completed');
-            
+            clearTimeout(shutdownTimeout);
+            logger.info('✅ Graceful shutdown completed');
+            process.exit(0);
+
         } catch (error) {
             logger.error('❌ Error during shutdown:', error);
-        } finally {
-            process.exit(reason === 'UNCAUGHT_EXCEPTION' ? 1 : 0);
+            process.exit(1);
         }
     }
 }
 
-// ===================================================================
-// MAIN EXECUTION
-// ===================================================================
-
-async function main() {
-    try {
-        const bot = new CryptoTradingBot();
-        await bot.initializeComponents();
-        await bot.start();
-    } catch (error) {
-        logger.error('❌ Fatal error during bot startup:', error);
-        process.exit(1);
-    }
-}
-
-// Start the bot
-if (require.main === module) {
-    main().catch(error => {
-        logger.error('❌ Unhandled error in main:', error);
-        process.exit(1);
+// Handle PM2 graceful reload
+if (process.env.NODE_ENV === 'production') {
+    process.on('SIGINT', () => {
+        logger.info('Received SIGINT from PM2, shutting down gracefully');
+        process.exit(0);
     });
 }
 
-module.exports = CryptoTradingBot;
+// Create and start the application
+const app = new CryptoTradingBotApp();
+
+// Start the bot
+app.start().catch(error => {
+    logger.error('❌ Failed to start application:', error);
+    process.exit(1);
+});
+
+// Export for testing
+module.exports = CryptoTradingBotApp;

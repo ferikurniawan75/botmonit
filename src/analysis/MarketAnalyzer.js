@@ -17,6 +17,26 @@ class MarketAnalyzer extends EventEmitter {
         this.updateInterval = null;
         this.isRunning = false;
         
+        
+// Add default config fallbacks at top of constructor
+if (!config.TRADING_PAIRS) {
+    config.TRADING_PAIRS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+}
+if (!config.MARKET_CATEGORIES) {
+    config.MARKET_CATEGORIES = {
+        major: ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'],
+        altcoins: ['ADAUSDT', 'DOTUSDT', 'LINKUSDT']
+    };
+}
+if (!config.MARKET_UPDATE_INTERVAL) {
+    config.MARKET_UPDATE_INTERVAL = 30000; // 30 seconds
+}
+if (!config.PRICE_HISTORY_LIMIT) {
+    config.PRICE_HISTORY_LIMIT = 200;
+}
+if (!config.VOLUME_THRESHOLD_USDT) {
+    config.VOLUME_THRESHOLD_USDT = 1000000;
+}
         this.setupEventHandlers();
     }
 
@@ -44,11 +64,13 @@ class MarketAnalyzer extends EventEmitter {
         try {
             logger.market('Starting market data streams');
             
-            // Start ticker streams for all trading pairs
-            this.binanceAPI.startTickerStream(config.TRADING_PAIRS);
+            // Start ticker streams for trading pairs
+            if (config.TRADING_PAIRS && config.TRADING_PAIRS.length > 0) {
+                this.binanceAPI.startTickerStream(config.TRADING_PAIRS);
+            }
 
             // Start kline streams for major pairs
-            const majorPairs = config.MARKET_CATEGORIES.major;
+            const majorPairs = config.MARKET_CATEGORIES?.major || ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
             for (const symbol of majorPairs) {
                 this.binanceAPI.startKlineStream(symbol, '5m');
                 this.activeStreams.add(`kline_${symbol}_5m`);
@@ -57,7 +79,7 @@ class MarketAnalyzer extends EventEmitter {
             // Start periodic market analysis
             this.updateInterval = setInterval(() => {
                 this.performMarketAnalysis();
-            }, config.MARKET_UPDATE_INTERVAL);
+            }, config.MARKET_UPDATE_INTERVAL || 30000);
 
             this.isRunning = true;
             logger.market('Market data streams started successfully');
@@ -67,7 +89,6 @@ class MarketAnalyzer extends EventEmitter {
             throw error;
         }
     }
-
     async stopDataStream() {
         if (!this.isRunning) {
             return;

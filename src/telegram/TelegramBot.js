@@ -59,7 +59,7 @@ class TelegramBot extends EventEmitter {
 
     async testConnection() {
         try {
-            const me = await this.bot.getMe();
+            if (!this.bot) throw new Error("Bot not initialized"); const me = await this.bot.getMe();
             logger.telegram('Bot connection test successful', { username: me.username });
             return true;
         } catch (error) {
